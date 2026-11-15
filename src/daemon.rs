@@ -18,6 +18,8 @@ pub const PROTOCOL: &str = "pressroom.local/1";
 pub const REPORT: &str = "pressroom.report/1";
 const REPORT_EVERY: Duration = Duration::from_secs(20);
 const SENDER_LIMIT: Duration = Duration::from_secs(15);
+/// The most a report may weigh as JSON; Galley's sender refuses more.
+const REPORT_BYTES: usize = 256 * 1024;
 const TICK: Duration = Duration::from_secs(5);
 /// A job's leases die with its process; the expiry is only a last resort.
 const JOB_LEASE_SECS: u64 = 7 * 24 * 3600;
@@ -944,7 +946,7 @@ fn clip(text: &str, max: usize) -> Value {
 
 /// The report (contracts/report-v1.md): what `status` measures, in whole numbers, without
 /// process ids, lane folders or managed folders.
-fn report(shared: &Arc<Shared>) -> Value {
+fn report(shared: &Arc<Shared>, max_leases: usize) -> Value {
     let state = shared.lock();
     let at = now();
     let budget = admit::budget(&state.config.limits, &state.measured);
@@ -985,7 +987,7 @@ fn report(shared: &Arc<Shared>) -> Value {
     let leases = leases
         .iter()
         .filter(|l| l.live(at, &lease::pid_alive))
-        .take(256)
+        .take(max_leases)
         .map(|l| {
             obj(vec![
                 ("id", s(&l.id)),
@@ -1058,12 +1060,26 @@ fn report(shared: &Arc<Shared>) -> Value {
     ])
 }
 
-/// Send one report at once and then one every 20 seconds, for as long as the daemon runs.
+/// The report as one line, within `REPORT_BYTES`: leases are left out from the end until it fits.
+fn report_line(shared: &Arc<Shared>) -> String {
+    let mut max = 256;
+    loop {
+        let line = json::write(&report(shared, max));
+        if line.len() <= REPORT_BYTES || max == 0 {
+            return line;
+        }
+        max /= 2;
+    }
+}
+
+/// Send one report at once and then one on each tick of a fixed timetable, for as long as the
+/// daemon runs. A send that overruns a tick waits for the next one; nothing drifts.
 fn report_loop(shared: &Arc<Shared>, galley: &machine::Galley) {
     let every = report_every();
     let mut failing = false;
+    let mut due = std::time::Instant::now();
     loop {
-        let line = json::write(&report(shared));
+        let line = report_line(shared);
         match send_report(galley, &line) {
             Ok(()) if failing => {
                 failing = false;
@@ -1080,7 +1096,11 @@ fn report_loop(shared: &Arc<Shared>, galley: &machine::Galley) {
             }
             Err(_) => {}
         }
-        std::thread::sleep(every);
+        let now = std::time::Instant::now();
+        while due <= now {
+            due += every;
+        }
+        std::thread::sleep(due - now);
     }
 }
 
@@ -1096,6 +1116,20 @@ fn report_every() -> Duration {
         }
     }
     REPORT_EVERY
+}
+
+fn sender_limit() -> Duration {
+    // Debug builds only, for tests: a shorter deadline.
+    #[cfg(debug_assertions)]
+    {
+        if let Some(secs) = std::env::var("PRESSROOM_TEST_SENDER_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Duration::from_secs(secs.max(1));
+        }
+    }
+    SENDER_LIMIT
 }
 
 /// Run the sender with the report on its standard input. `Err` carries its exit code (none if
@@ -1115,10 +1149,14 @@ fn send_report(galley: &machine::Galley, line: &str) -> Result<(), (Option<i32>,
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| (None, format!("cannot start the sender: {e}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // A sender that exits without reading is judged by its exit code below.
-        let _ = stdin.write_all(line.as_bytes()).and_then(|_| stdin.write_all(b"\n"));
-    }
+    // Written beside the deadline, so a sender that never reads cannot hold the daemon past it;
+    // killing the sender closes the pipe and ends the write.
+    let writer = child.stdin.take().map(|mut stdin| {
+        let line = format!("{line}\n");
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(line.as_bytes());
+        })
+    });
     let stderr = child.stderr.take();
     let reader = std::thread::spawn(move || {
         let mut first = String::new();
@@ -1131,7 +1169,7 @@ fn send_report(galley: &machine::Galley, line: &str) -> Result<(), (Option<i32>,
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() >= SENDER_LIMIT => {
+            Ok(None) if started.elapsed() >= sender_limit() => {
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -1140,10 +1178,18 @@ fn send_report(galley: &machine::Galley, line: &str) -> Result<(), (Option<i32>,
             Err(_) => break None,
         }
     };
+    let Some(status) = status else {
+        // A process the sender started may still hold its pipes: leave the two threads to end
+        // with it rather than wait on them.
+        return Err((None, "the sender did not finish in time".into()));
+    };
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
     let why = reader.join().unwrap_or_default();
-    match status {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => Err((status.code(), why)),
-        None => Err((None, "the sender did not finish in 15 seconds".into())),
+    if status.success() {
+        Ok(())
+    } else {
+        Err((status.code(), why))
     }
 }

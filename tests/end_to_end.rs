@@ -28,6 +28,7 @@ impl Machine {
             .env("PRESSROOM_HOME", &home)
             .env("PRESSROOM_TEST_LOAD", "0")
             .env("PRESSROOM_TEST_REPORT_SECS", "1")
+            .env("PRESSROOM_TEST_SENDER_SECS", "2")
             .env("SECRET_IN_THE_DAEMONS_ENV", "must-not-reach-the-sender")
             .stderr(Stdio::null())
             .spawn()
@@ -702,6 +703,7 @@ fn fake_sender(dir: &Path) -> PathBuf {
         format!(
             "#!/bin/sh\nd={d}\necho \"$@\" > $d/args\nenv > $d/env\ncat > $d/report.tmp && mv $d/report.tmp $d/report\n\
              n=$(cat $d/count 2>/dev/null || echo 0); echo $((n+1)) > $d/count\n\
+             if [ -f $d/slow ]; then sleep $(cat $d/slow); fi\n\
              if [ -f $d/exit ]; then echo authorization_denied >&2; exit $(cat $d/exit); fi\n",
             d = dir.display()
         ),
@@ -832,4 +834,29 @@ fn without_galley_settings_nothing_is_sent_and_half_set_ones_stop_the_daemon() {
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("set all three or none"), "{}", text(&out.stderr));
     let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_slow_or_stuck_sender_neither_holds_the_daemon_nor_moves_the_timetable() {
+    let m = Machine::start_with("slow", galley_conf);
+    let out = m.home.join("out");
+    let count = || -> u32 {
+        fs::read_to_string(out.join("count")).unwrap_or_default().trim().parse().unwrap_or(0)
+    };
+    wait_file(&out.join("count"), |c| !c.trim().is_empty());
+    // A send that takes 0.6 s of each 1 s tick: still one report a tick, not one every 1.6 s.
+    fs::write(out.join("slow"), "0.6").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = count();
+    std::thread::sleep(Duration::from_millis(6200));
+    let sent = count() - before;
+    assert!(sent >= 6, "only {sent} reports in 6.2 s");
+
+    // A sender that never finishes is killed at its deadline and recorded once; work goes on.
+    fs::write(out.join("slow"), "30").unwrap();
+    let events = wait_file(&m.home.join("events.log"), |e| e.contains("did not finish in time"));
+    assert_eq!(events.matches("report_failed").count(), 1, "{events}");
+    assert!(m.cmd(&["run", "--", "true"]).status.success());
+    fs::remove_file(out.join("slow")).unwrap();
+    wait_file(&m.home.join("events.log"), |e| e.contains("report_sent"));
 }

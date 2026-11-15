@@ -17,8 +17,10 @@ and behaves exactly as `local-v1.md` says. With one or two set it does not start
 | `galley_credential` | Absolute path of the machine's agent identity configuration: the same file and key an agent uses (`docs/agent-connect.md` in Galley). It names the project, the grant and the machine's principal. |
 | `galley_sender` | Absolute path of the program that sends the report (Galley's `galley-machine-report`). |
 
-The daemon sends one report when it starts and then one every 20 seconds. It opens no port.
-A report that fails is not retried before the next one is due; the next is sent on time.
+The daemon sends one report when it starts and then one every 20 seconds, counted from when
+it started, not from when the last one finished. It opens no port. A report that fails is not
+retried before the next one is due; a report still being sent when the next is due makes that
+one wait for the following tick.
 
 ## How it is sent
 
@@ -31,7 +33,9 @@ crypto crate would need an allowlist entry. So the daemon runs the sender:
 ```
 
 with the report as one line of JSON on standard input, an environment holding only `PATH`
-and `HOME`, and 15 seconds to finish, after which it is killed. Its arguments are paths and
+and `HOME`, and 15 seconds to finish, after which it is killed, whether or not it has read
+its input. A sender that is a wrapper script should `exec` the program it wraps, so
+that killing it ends the program too. Its arguments are paths and
 an address, never a secret. The sender loads the identity configuration with Galley's own
 loader, refuses it if its `resource` is not at `<galley>`, and sends the command
 `host.heartbeat` with body `{ "report": <the report> }`, resource the configuration's
@@ -50,19 +54,22 @@ refused every 20 seconds writes one line, not thousands.
 
 ## The report
 
-One JSON object. Every field is required; there are no others.
+One JSON object. Every field is required; there are no others. Every number is a whole
+number (Galley's records hold no fractions), so memory and disk are in bytes and load is in
+hundredths.
 
 ```json
 {"v":"pressroom.report/1","measuredAt":1763240000,
  "name":"worker-a","kind":"worker","os":"Linux 6.12.1","arch":"x86_64",
- "threads":32,"memoryGb":64,"offeredThreads":24,"offeredMemoryGb":48,
- "usedThreads":8,"usedMemoryGb":6,"personPresent":false,"load1":9.5,"outsideLoad":1.5,
- "diskFreeGb":412.3,"diskFloorGb":20,
+ "threads":32,"memoryBytes":68719476736,"offeredThreads":24,"offeredMemoryBytes":51539607552,
+ "usedThreads":8,"usedMemoryBytes":6442450944,"personPresent":false,
+ "loadHundredths":950,"outsideThreads":2,
+ "diskFreeBytes":442381631488,"diskFloorBytes":21474836480,
  "toolchains":[{"name":"rustc","version":"rustc 1.99.1 (abc 2026-10-30)"}],
  "running":[{"job":"j-1763240000-7","holder":"agent:builder-a","label":"cargo test",
-             "class":"gate","threads":8,"memoryGb":6,"forSecs":340}],
+             "class":"gate","threads":8,"memoryBytes":6442450944,"forSecs":340}],
  "waiting":[{"holder":"agent:builder-b","label":"cargo build","class":"batch","threads":8,
-             "reason":"8 of 24 threads free; it needs 16","forSecs":20}],
+             "reason":"14 of 24 threads free; it needs 16","forSecs":20}],
  "leases":[{"id":"j-1763240000-7-lane","holder":"agent:builder-a","kind":"cache",
             "mode":"in-use","paths":["/home/galley/.pressroom/lanes/colophon/default/0"],
             "expires":1763844800}],
@@ -75,23 +82,26 @@ One JSON object. Every field is required; there are no others.
 | `name` | `name` in `machine.conf`, else the host name | declared |
 | `kind` | `workstation` or `worker` (`server` reports as `worker`, as in `status`) | declared |
 | `os`, `arch` | `uname -sr`; the processor family the daemon was built for | measured |
-| `threads`, `memoryGb` | What the machine has | measured |
-| `offeredThreads`, `offeredMemoryGb` | What it offers agents now (`local-v1.md`, rule 1) | worked out |
-| `usedThreads`, `usedMemoryGb` | What admitted work holds | measured |
+| `threads`, `memoryBytes` | What the machine has | measured |
+| `offeredThreads`, `offeredMemoryBytes` | What it offers agents now (`local-v1.md`, rule 1); `offeredThreads` is at most `threads` | worked out |
+| `usedThreads`, `usedMemoryBytes` | What admitted work holds | measured |
 | `personPresent` | Whether its person counts as present | measured (macOS), else as `local-v1.md` says |
-| `load1` | One-minute load | measured |
-| `outsideLoad` | Load the daemon did not admit | worked out |
-| `diskFreeGb`, `diskFloorGb` | Free disk where the daemon keeps its files, and the owner's floor | measured; declared |
+| `loadHundredths` | One-minute load times 100, rounded | measured |
+| `outsideThreads` | Load the daemon did not admit, in whole threads, as admission counts it | worked out |
+| `diskFreeBytes`, `diskFloorBytes` | Free disk where the daemon keeps its files, and the owner's floor | measured; declared |
 | `toolchains` | Each toolchain found, with its version line as the tool prints it, at most 16 | measured |
-| `running` | Admitted work: its job, holder, label, class, threads, memory and seconds running, at most 64 | measured |
+| `running` | Admitted work: its job, holder, label, class, threads, `memoryBytes` and seconds running, at most 64 | measured |
 | `waiting` | Work in line, in order, with the reason in plain words, at most 64 | measured |
 | `leases` | Live leases: id, holder, kind, mode, paths, end, at most 256 | measured |
 | `unreadableLeases` | How many lease files cannot be read | measured |
 
-Numbers are not negative. Text fields are at most 256 characters, except `os` and a
-toolchain's `version` (512) and a lease path (1024). Lists longer than their limit are cut
-to it, the oldest work first kept. A report never carries a process id, a lane folder of a
-running job, a managed folder, a token or a key.
+Text fields are at most 256 bytes, except `name` and `job` (128), `os` and a toolchain's
+`version` (512) and a lease path (1024); longer text is cut, blank text is sent as `-`, and a
+lease path that is too long is left out rather than cut. Lists longer than their limit are
+cut to it, the first in order kept. **The whole report is at most 256 KiB:** while it is
+larger, leases are left out from the end. A report never carries a process id, the lane field
+or managed folders that `status` shows, a token or a key. Lease paths are sent as they are,
+so they name lane folders and other paths under the daemon's home.
 
 ## What the report is not
 
