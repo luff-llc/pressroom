@@ -5,8 +5,8 @@ who run work, and tools that clean up. Version `pressroom.local/1`; lease files 
 `pressroom.lease/1`. Tested by `tests/end_to_end.rs`. Checked once by a separate agent on
 2026-11-15; what it found and what was done is in `docs/review/2026-11-15-slice-1.md`.
 
-This covers one machine. Heartbeats to Galley, enrolment, grants and power are later
-contracts.
+This covers one machine. The report to Galley is `report-v1.md`; enrolment, grants and power
+are later contracts.
 
 ## Files
 
@@ -35,6 +35,7 @@ Everything is under `$PRESSROOM_HOME`, else `~/.pressroom`, readable by its user
 | `disk_floor_gb` | `20` | Nothing new starts below this much free disk |
 | `grace_hours` | `24` | A path changed more recently than this is not removable |
 | `managed` | | A further folder a cleanup tool may touch. Repeatable. |
+| `galley`, `galley_credential`, `galley_sender` | | Where and how to send the report to Galley. All three or none (`report-v1.md`). |
 
 A `#` starts a comment at the start of a line or after a space. The daemon reads
 `machine.conf` when it starts; restart it after a change.
@@ -169,4 +170,4 @@ replaced by a default. A connection that sends nothing for ten seconds is closed
 - **The grace time looks at the path itself,** not at everything inside it.
 - **Many idle connections can use up the daemon's file handles** for up to ten seconds.
 - **Linux is untested.** Everything so far ran on macOS.
-- No heartbeat to Galley, no power, no energy figure, no data classes.
+- No power, no energy figure, no data classes. The report to Galley is `report-v1.md`.

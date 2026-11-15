@@ -57,6 +57,39 @@ pub struct Config {
     /// Folders a cleanup tool may touch, the built-in ones included.
     pub managed: Vec<PathBuf>,
     pub grace_secs: u64,
+    /// Where to send the report (contracts/report-v1.md), if anywhere.
+    pub galley: Option<Galley>,
+}
+
+/// The three settings that turn the report on. All three or none.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Galley {
+    /// `https://host[:port]`, nothing after it; `http://` only for a loopback host.
+    pub origin: String,
+    /// The machine's agent identity configuration.
+    pub credential: PathBuf,
+    /// The program that sends the report.
+    pub sender: PathBuf,
+}
+
+/// An address with a scheme, a host and perhaps a port, and nothing else.
+pub fn galley_origin(value: &str) -> Option<String> {
+    let (scheme, rest) = value.split_once("://")?;
+    let host = rest.rsplit_once(':').map_or(rest, |(h, port)| {
+        if !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()) {
+            h
+        } else {
+            rest
+        }
+    });
+    let host_ok = !host.is_empty()
+        && (host == "[::1]"
+            || host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'));
+    let loopback = ["localhost", "127.0.0.1", "[::1]"].contains(&host);
+    let ok = host_ok && (scheme == "https" || (scheme == "http" && loopback));
+    ok.then(|| value.to_string())
 }
 
 /// Read `machine.conf`: lines of `key = value`, `#` for comments. Unknown keys and bad
@@ -79,7 +112,9 @@ pub fn load_config(layout: &Layout, total_memory: u64) -> Result<Config, String>
             .map(|dir| crate::lease::normalise(dir, Path::new("/")))
             .collect(),
         grace_secs: 24 * 3600,
+        galley: None,
     };
+    let (mut origin, mut credential, mut sender) = (None, None, None);
     let path = layout.config();
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -152,9 +187,41 @@ pub fn load_config(layout: &Layout, total_memory: u64) -> Result<Config, String>
                     .managed
                     .push(crate::lease::normalise(dir, Path::new("/")));
             }
+            "galley" => {
+                origin = Some(galley_origin(value).ok_or_else(|| {
+                    bad("galley is https:// and a host, with nothing after it")
+                })?)
+            }
+            "galley_credential" | "galley_sender" => {
+                let file = Path::new(value);
+                if !file.is_absolute() || file.components().any(|c| {
+                    matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)
+                }) {
+                    return Err(bad("expected an absolute path"));
+                }
+                if key == "galley_credential" {
+                    credential = Some(file.to_path_buf());
+                } else {
+                    sender = Some(file.to_path_buf());
+                }
+            }
             _ => return Err(bad("unknown setting")),
         }
     }
+    config.galley = match (origin, credential, sender) {
+        (None, None, None) => None,
+        (Some(origin), Some(credential), Some(sender)) => Some(Galley {
+            origin,
+            credential,
+            sender,
+        }),
+        _ => {
+            return Err(format!(
+                "{}: galley, galley_credential and galley_sender go together; set all three or none",
+                path.display()
+            ))
+        }
+    };
     Ok(config)
 }
 
@@ -352,7 +419,32 @@ mod tests {
         let c = load_config(&layout, GB).unwrap();
         assert!(c.managed[4].to_string_lossy().ends_with("ci#keep"));
 
+        assert!(c.galley.is_none());
+        fs::write(
+            layout.config(),
+            "galley = https://galley.example.test\ngalley_credential = /home/galley/.pressroom/identity.json\n\
+             galley_sender = /opt/galley/bin/galley-machine-report\n",
+        )
+        .unwrap();
+        let g = load_config(&layout, GB).unwrap().galley.unwrap();
+        assert_eq!(g.origin, "https://galley.example.test");
+        assert_eq!(g.sender, PathBuf::from("/opt/galley/bin/galley-machine-report"));
+        fs::write(
+            layout.config(),
+            "galley = http://127.0.0.1:8080\ngalley_credential = /a/b\ngalley_sender = /c/d\n",
+        )
+        .unwrap();
+        assert!(load_config(&layout, GB).is_ok());
+
         for bad in [
+            "galley = https://galley.example.test",
+            "galley = https://galley.example.test\ngalley_credential = /a/b",
+            "galley_sender = /c/d",
+            "galley = http://galley.example.test\ngalley_credential = /a/b\ngalley_sender = /c/d",
+            "galley = https://galley.example.test/v1\ngalley_credential = /a/b\ngalley_sender = /c/d",
+            "galley = https://user@galley.example.test\ngalley_credential = /a/b\ngalley_sender = /c/d",
+            "galley = https://galley.example.test\ngalley_credential = a/b\ngalley_sender = /c/d",
+            "galley = https://galley.example.test\ngalley_credential = /a/../b\ngalley_sender = /c/d",
             "share_present = 1.5",
             "share_away = 0",
             "kind = laptop",
