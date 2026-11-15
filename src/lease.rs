@@ -7,7 +7,6 @@ use crate::json::{self, n64, obj, s, strs, Value};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 
 pub const VERSION: &str = "pressroom.lease/1";
 pub const KINDS: [&str; 7] = [
@@ -81,6 +80,14 @@ impl Lease {
         if lease.paths.is_empty() || lease.paths.iter().any(|p| !Path::new(p).is_absolute()) {
             return Err("lease paths must be absolute".into());
         }
+        let odd = |p: &String| {
+            Path::new(p)
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        };
+        if lease.paths.iter().any(odd) {
+            return Err("lease paths must not contain . or ..".into());
+        }
         Ok(lease)
     }
 
@@ -93,7 +100,7 @@ impl Lease {
     pub fn covers(&self, path: &Path) -> bool {
         self.paths.iter().any(|leased| {
             let leased = Path::new(leased);
-            path.starts_with(leased) || leased.starts_with(path)
+            within(path, leased) || within(leased, path)
         })
     }
 }
@@ -115,10 +122,17 @@ pub fn normalise(path: &Path, cwd: &Path) -> PathBuf {
     } else {
         cwd.join(path)
     };
+    // Walk the parts the way the system does: a `..` steps up from where the path so
+    // far really is, links resolved, not from how it was spelled. Otherwise
+    // `link/../x` would be read as a sibling of the link when the system reads it as a
+    // sibling of the link's target.
     let mut out = PathBuf::new();
     for part in joined.components() {
         match part {
             Component::ParentDir => {
+                if let Ok(real) = fs::canonicalize(&out) {
+                    out = real;
+                }
                 out.pop();
             }
             Component::CurDir => {}
@@ -145,30 +159,39 @@ pub fn normalise(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+/// Is one path the other, or inside it? On macOS names differ only by case are the
+/// same file on the usual filesystem, so case is ignored there: covering too much is
+/// the safe mistake.
+pub fn within(path: &Path, root: &Path) -> bool {
+    if cfg!(target_os = "macos") {
+        let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+        lower(path).starts_with(lower(root))
+    } else {
+        path.starts_with(root)
+    }
+}
+
+extern "C" {
+    /// From the C library every Rust program already links. Signal 0 sends nothing; it
+    /// only asks whether the process exists.
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
 pub fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
         return false;
     }
-    if cfg!(target_os = "linux") {
-        return Path::new(&format!("/proc/{pid}")).exists();
+    // SAFETY: `kill` with signal 0 has no effect on any process and touches no memory.
+    if unsafe { kill(pid, 0) } == 0 {
+        return true;
     }
-    // `kill -0` sends nothing; it only asks whether the process exists. A process owned
-    // by another user reports a permission error, which also means it exists.
-    match Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-    {
-        Ok(out) => {
-            out.status.success()
-                || String::from_utf8_lossy(&out.stderr)
-                    .to_lowercase()
-                    .contains("not permitted")
-        }
-        // If we cannot tell, say alive: keeping something is the safe mistake.
-        Err(_) => true,
-    }
+    // "No such process" means gone. Anything else (a process of another user answers
+    // "not permitted") means it exists, or we cannot tell: keeping is the safe mistake.
+    const ESRCH: i32 = 3;
+    std::io::Error::last_os_error().raw_os_error() != Some(ESRCH)
 }
 
 /// The folder of lease files.
@@ -229,7 +252,15 @@ impl Store {
                 .and_then(|text| json::parse(&text))
                 .and_then(|v| Lease::from_json(&v));
             match parsed {
-                Ok(lease) => leases.push(lease),
+                Ok(mut lease) => {
+                    // A lease written by another tool may name a path through a link.
+                    for path in &mut lease.paths {
+                        *path = normalise(Path::new(path), Path::new("/"))
+                            .to_string_lossy()
+                            .to_string();
+                    }
+                    leases.push(lease)
+                }
                 Err(_) => unreadable.push(name),
             }
         }
@@ -387,6 +418,7 @@ mod tests {
         assert!(!l.live(50, &|_| false), "process gone");
         assert!(pid_alive(std::process::id()));
         assert!(!pid_alive(0));
+        assert!(!pid_alive(u32::MAX));
     }
 
     #[test]
@@ -423,6 +455,67 @@ mod tests {
             normalise(&root.join("link/not-yet/there"), cwd),
             root.join("real/not-yet/there")
         );
+    }
+
+    #[test]
+    fn dot_dot_through_a_link_goes_where_the_system_goes() {
+        let root = temp("dotdot");
+        fs::create_dir_all(root.join("outside/deep")).unwrap();
+        fs::create_dir_all(root.join("managed")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside/deep"), root.join("managed/link")).unwrap();
+        // The system reads managed/link/../victim as outside/victim.
+        assert_eq!(
+            normalise(&root.join("managed/link/../victim"), Path::new("/")),
+            root.join("outside/victim")
+        );
+        let store = Store::new(root.join("leases"));
+        let managed = vec![root.join("managed")];
+        let rules = DeleteRules {
+            managed: &managed,
+            grace_secs: 0,
+        };
+        let asked = normalise(&root.join("managed/link/../victim"), Path::new("/"));
+        assert!(matches!(
+            may_delete(&store, &rules, &asked, u64::MAX / 2, None),
+            Verdict::No(_)
+        ));
+    }
+
+    #[test]
+    fn leases_written_by_other_tools() {
+        let root = temp("foreign");
+        fs::create_dir_all(root.join("real/cache")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let store = Store::new(root.join("leases"));
+        fs::create_dir_all(&store.dir).unwrap();
+        let file = |name: &str, path: &str| {
+            let text = format!(
+                r#"{{"version":"pressroom.lease/1","id":"{name}","holder":"tool","kind":"cache","paths":["{path}"],"expires":9999999999}}"#
+            );
+            fs::write(store.dir.join(format!("{name}.json")), text).unwrap();
+        };
+        // Named through a link: still covers the real path.
+        file("via-link", &root.join("link/cache").to_string_lossy());
+        let (leases, unreadable) = store.all();
+        assert!(unreadable.is_empty());
+        assert!(leases[0].covers(&root.join("real/cache/x")));
+        // Containing `..`: not a valid lease, so it is unreadable and blocks removal.
+        file("dotty", &root.join("real/../real/cache").to_string_lossy());
+        assert_eq!(store.all().1, vec!["dotty.json".to_string()]);
+        // The same key twice: readers disagree on which wins, so it is unreadable.
+        fs::write(
+            store.dir.join("twice.json"),
+            r#"{"version":"pressroom.lease/1","id":"twice","holder":"t","kind":"cache","paths":["/x"],"expires":1,"expires":9999999999}"#,
+        )
+        .unwrap();
+        assert!(store.all().1.contains(&"twice.json".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn case_is_ignored_on_macos() {
+        let l = lease("a", "cache", Path::new("/home/g/scratch/Dep"), 100, None);
+        assert!(l.covers(Path::new("/home/g/scratch/dep/x")));
     }
 
     #[test]

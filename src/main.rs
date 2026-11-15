@@ -147,6 +147,21 @@ fn main() {
                     _ => a.nice = false,
                 }
             }
+            if !["waiting", "gate", "batch"].contains(&a.class.as_str()) {
+                usage("--class is waiting, gate or batch");
+            }
+            if ![
+                "cache",
+                "registry",
+                "toolchain",
+                "worktree",
+                "result",
+                "scratch",
+            ]
+            .contains(&a.lease_kind.as_str())
+            {
+                usage("--lease-kind is cache, registry, toolchain, worktree, result or scratch");
+            }
             client::run(&layout, a)
         }
         "status" => {

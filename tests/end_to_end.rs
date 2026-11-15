@@ -449,3 +449,240 @@ fn a_leased_path_that_vanishes_is_the_machines_fault() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// Speak to the socket directly, one JSON line, and keep the connection.
+fn raw(m: &Machine, line: &str) -> std::os::unix::net::UnixStream {
+    use std::io::Write;
+    // A burst of connections can be turned away for a moment; try again.
+    let mut tries = 0;
+    let mut stream = loop {
+        match std::os::unix::net::UnixStream::connect(m.home.join("sock")) {
+            Ok(stream) => break stream,
+            Err(e) => {
+                tries += 1;
+                assert!(tries < 200, "cannot connect: {e}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    stream.write_all(line.as_bytes()).unwrap();
+    stream.write_all(b"\n").unwrap();
+    stream
+}
+
+fn first_line(stream: std::os::unix::net::UnixStream) -> String {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap();
+    line
+}
+
+#[test]
+fn a_client_that_stops_reading_does_not_hold_the_queue() {
+    let m = Machine::start("stall", ONE_THREAD);
+    let holding = m
+        .command(&["run", "--label", "holding", "--", "sleep", "3"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    m.wait_for("holding running", |s| s.contains("\"usedThreads\":1"));
+    // Next in line: connected, never reads, never leaves.
+    let stalled = raw(
+        &m,
+        r#"{"op":"run","holder":"agent:stalled","label":"stalled","threads":1}"#,
+    );
+    m.wait_for("stalled queued", |s| s.contains("\"label\":\"stalled\""));
+    let behind = m
+        .command(&["run", "--label", "behind", "--", "true"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    m.wait_for("behind queued", |s| s.contains("\"label\":\"behind\""));
+    // Fill the stalled client's buffer: every change makes the daemon write to it.
+    for _ in 0..3000 {
+        drop(raw(&m, r#"{"op":"release","id":"zz"}"#));
+    }
+    let mut holding = holding;
+    assert!(holding.wait().unwrap().success());
+    // The stalled client's buffer is full, so the daemon cannot tell it anything. It
+    // must be dropped from the line while it is still connected, not waited on.
+    let mut behind = behind;
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = behind.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "still queued behind a stalled client:\n{}",
+            m.status()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(stalled);
+}
+
+#[test]
+fn dot_dot_through_a_link_is_not_a_way_out() {
+    let m = Machine::start("dotdot", WORKER);
+    let home = fs::canonicalize(&m.home).unwrap();
+    fs::create_dir_all(home.join("outside/deep")).unwrap();
+    fs::create_dir_all(home.join("outside/victim")).unwrap();
+    std::os::unix::fs::symlink(home.join("outside/deep"), home.join("scratch/link")).unwrap();
+    let sneaky = home.join("scratch/link/../victim");
+    let out = m.cmd(&["may-delete", sneaky.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(text(&out.stdout).contains("outside the managed folders"));
+    assert_eq!(
+        m.cmd(&["delete-begin", sneaky.to_str().unwrap()])
+            .status
+            .code(),
+        Some(1)
+    );
+    // And a lease taken that way protects the real place.
+    assert!(m
+        .cmd(&["lease", "add", sneaky.to_str().unwrap()])
+        .status
+        .success());
+    assert!(
+        text(&m.cmd(&["leases"]).stdout).contains(home.join("outside/victim").to_str().unwrap())
+    );
+}
+
+#[test]
+fn a_build_waits_while_its_lanes_are_being_removed() {
+    let m = Machine::start("lanewait", WORKER);
+    let base = fs::canonicalize(&m.home).unwrap().join("lanes/del/T");
+    fs::create_dir_all(base.join("0")).unwrap();
+    // Leases held by live processes used to make this take most of a minute.
+    for i in 0..10 {
+        let dir = fs::canonicalize(&m.home)
+            .unwrap()
+            .join(format!("scratch/held-{i}"));
+        let pid = std::process::id().to_string();
+        assert!(m
+            .cmd(&["lease", "add", "--pid", &pid, dir.to_str().unwrap()])
+            .status
+            .success());
+    }
+    let begin = m.cmd(&["delete-begin", base.to_str().unwrap()]);
+    assert!(begin.status.success(), "{}", text(&begin.stderr));
+    let started = Instant::now();
+    let job = m
+        .command(&[
+            "run",
+            "--lane",
+            "del",
+            "--toolchain",
+            "T",
+            "--label",
+            "lane job",
+            "--",
+            "true",
+        ])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    m.wait_for("waiting on the removal", |s| {
+        s.contains("is being removed by")
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the daemon stalled"
+    );
+    assert!(m
+        .cmd(&["delete-end", &text(&begin.stdout)])
+        .status
+        .success());
+    let out = job.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn only_a_removal_is_blamed_on_the_machine() {
+    let m = Machine::start("blame", WORKER);
+    // A leased path that was never there is not a removal.
+    let out = m.cmd(&[
+        "run",
+        "--lease",
+        "/nonexistent-pressroom-test",
+        "--",
+        "sh",
+        "-c",
+        "exit 3",
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(!text(&out.stderr).contains("removed while"));
+    // A command that could not be started is 127, whatever it leased.
+    let out = m.cmd(&[
+        "run",
+        "--lease",
+        "/nonexistent-pressroom-test",
+        "--",
+        "/no/such/program",
+    ]);
+    assert_eq!(out.status.code(), Some(127));
+    // A script over several lines needs no label.
+    let out = m.cmd(&["run", "--", "sh", "-c", "true\n\ttrue"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    // A command ended by a signal reports it.
+    let out = m.cmd(&["run", "--", "sh", "-c", "kill -9 $$"]);
+    assert_eq!(out.status.code(), Some(137));
+    // Wrong arguments are 64, not a refusal.
+    assert_eq!(
+        m.cmd(&["run", "--class", "bogus", "--", "true"])
+            .status
+            .code(),
+        Some(64)
+    );
+}
+
+#[test]
+fn bad_requests_are_refused_in_words() {
+    let m = Machine::start("strict", WORKER);
+    for bad in [
+        r#"{"op":"run","threads":-1}"#,
+        r#"{"op":"run","threads":"8"}"#,
+        r#"{"op":"run","threads":1.5}"#,
+        r#"{"op":"run","threads":0}"#,
+        r#"{"op":"run","memoryGb":"lots"}"#,
+        r#"{"op":"run","class":7}"#,
+        r#"{"op":"run","lane":"colophon"}"#,
+        r#"{"op":"run","leases":"/x"}"#,
+        r#"{"op":"run","pid":999999999}"#,
+        r#"{"op":"run","threads":1,"threads":2}"#,
+        r#"{"op":"nonsense"}"#,
+        "not json",
+    ] {
+        let reply = first_line(raw(&m, bad));
+        assert!(
+            reply.contains("\"state\":\"refused\"") && reply.contains("\"reason\""),
+            "{bad} -> {reply}"
+        );
+    }
+    assert!(m.status().contains("\"running\":[]"));
+    let events = fs::read_to_string(m.home.join("events.log")).unwrap();
+    assert!(
+        events.matches("\"event\":\"refused\"").count() >= 9,
+        "{events}"
+    );
+}
+
+#[test]
+fn one_daemon_per_home() {
+    let m = Machine::start("twice", WORKER);
+    let second = Command::new(BIN)
+        .arg("daemon")
+        .env("PRESSROOM_HOME", &m.home)
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(text(&second.stderr).contains("already running"));
+    assert!(
+        m.cmd(&["status"]).status.success(),
+        "the first daemon still answers"
+    );
+}

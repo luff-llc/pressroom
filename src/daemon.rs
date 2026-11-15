@@ -18,6 +18,8 @@ const TICK: Duration = Duration::from_secs(5);
 /// A job's leases die with its process; the expiry is only a last resort.
 const JOB_LEASE_SECS: u64 = 7 * 24 * 3600;
 const MAX_LINE: usize = 64 * 1024;
+const FIRST_LINE: Duration = Duration::from_secs(10);
+const WRITE: Duration = Duration::from_secs(2);
 const MAX_PATHS: usize = 32;
 
 struct Job {
@@ -99,12 +101,7 @@ pub fn serve(home: PathBuf) -> Result<(), String> {
         fs::create_dir_all(&dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
     }
     let socket = layout.socket();
-    if UnixStream::connect(&socket).is_ok() {
-        return Err(format!(
-            "a pressroom daemon is already listening on {}",
-            socket.display()
-        ));
-    }
+    claim(&layout)?;
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)
         .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
@@ -144,7 +141,20 @@ pub fn serve(home: PathBuf) -> Result<(), String> {
         let mut fresh = ticker.lock().measured.clone();
         machine::remeasure(&ticker.layout.home, &mut fresh);
         ticker.store.sweep(now());
-        ticker.lock().measured = fresh;
+        {
+            // A job's leases last as long as the job, however long that is.
+            let mut state = ticker.lock();
+            state.measured = fresh;
+            let at = now();
+            for id in state.running.iter().flat_map(|j| &j.lease_ids) {
+                if let Some(mut lease) = ticker.store.get(id) {
+                    if lease.expires.saturating_sub(at) < JOB_LEASE_SECS / 2 {
+                        lease.expires = at + JOB_LEASE_SECS;
+                        let _ = ticker.store.put(&lease);
+                    }
+                }
+            }
+        }
         ticker.changed.notify_all();
     });
 
@@ -159,6 +169,47 @@ pub fn serve(home: PathBuf) -> Result<(), String> {
         });
     }
     Ok(())
+}
+
+/// One daemon per home. The first to create `daemon.pid` is it; a file left by a daemon
+/// that is gone is replaced.
+fn claim(layout: &Layout) -> Result<(), String> {
+    let file = layout.home.join("daemon.pid");
+    for _ in 0..3 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+        {
+            Ok(mut f) => {
+                return writeln!(f, "{}", std::process::id())
+                    .map_err(|e| format!("cannot write {}: {e}", file.display()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let other = fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|t| t.trim().parse::<u32>().ok());
+                let young = fs::metadata(&file)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_none_or(|age| age < Duration::from_secs(5));
+                let answering = UnixStream::connect(layout.socket()).is_ok();
+                if let Some(pid) = other.filter(|pid| lease::pid_alive(*pid)) {
+                    // Alive and answering, or alive and only just started.
+                    if answering || young {
+                        return Err(format!(
+                            "a pressroom daemon (process {pid}) is already running on {}",
+                            layout.home.display()
+                        ));
+                    }
+                }
+                let _ = fs::remove_file(&file);
+            }
+            Err(e) => return Err(format!("cannot write {}: {e}", file.display())),
+        }
+    }
+    Err("another pressroom daemon is starting on this home".into())
 }
 
 fn send(stream: &mut UnixStream, value: &Value) -> Result<(), String> {
@@ -198,8 +249,14 @@ fn read_line(reader: &mut BufReader<UnixStream>) -> Result<Option<Value>, String
 fn handle(shared: &Arc<Shared>, stream: UnixStream) -> Result<(), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut stream = stream;
-    let Some(request) = read_line(&mut reader)? else {
-        return Ok(());
+    // A client that connects and says nothing, or stops reading, is dropped: it must
+    // not hold a thread, or its place in the queue, for ever.
+    let _ = stream.set_read_timeout(Some(FIRST_LINE));
+    let _ = stream.set_write_timeout(Some(WRITE));
+    let request = match read_line(&mut reader) {
+        Ok(Some(request)) => request,
+        Ok(None) => return Ok(()),
+        Err(why) => return refuse(&mut stream, format!("bad request: {why}")),
     };
     match request.str("op") {
         Some("run") => run(shared, &mut stream, &mut reader, &request),
@@ -244,7 +301,13 @@ fn text(request: &Value, key: &str, default: &str, max: usize) -> Result<String,
 
 /// Paths from a request: absolute, normalised, bounded in number.
 fn paths(request: &Value, key: &str) -> Result<Vec<PathBuf>, String> {
-    let given = request.strings(key);
+    let given = match request.get(key) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Arr(items)) if items.iter().all(|i| matches!(i, Value::Str(_))) => {
+            request.strings(key)
+        }
+        _ => return Err(format!("{key} must be a list of paths")),
+    };
     if given.len() > MAX_PATHS {
         return Err(format!("at most {MAX_PATHS} paths"));
     }
@@ -297,15 +360,39 @@ fn run(
     let parsed = (|| -> Result<_, String> {
         let holder = text(request, "holder", "unknown", 128)?;
         let label = text(request, "label", "work", 200)?;
-        let class = Class::parse(request.str("class").unwrap_or("batch")).ok_or("unknown class")?;
-        let threads = request.u64("threads").unwrap_or(1).clamp(1, 4096) as u32;
-        let memory = (request.num("memoryGb").unwrap_or(1.0).clamp(0.0, 1.0e6) * GB as f64) as u64;
+        // A field of the wrong type is refused, never quietly replaced by a default.
+        let class = match request.get("class") {
+            None | Some(Value::Null) => Class::Batch,
+            Some(Value::Str(name)) => {
+                Class::parse(name).ok_or("class is waiting, gate or batch")?
+            }
+            _ => return Err("class is waiting, gate or batch".into()),
+        };
+        let threads = match request.get("threads") {
+            None | Some(Value::Null) => 1,
+            Some(Value::Num(t)) if *t >= 1.0 && t.fract() == 0.0 => t.min(4096.0) as u32,
+            _ => return Err("threads must be a whole number, 1 or more".into()),
+        };
+        let memory = match request.get("memoryGb") {
+            None | Some(Value::Null) => GB,
+            Some(Value::Num(gb)) if *gb >= 0.0 => (gb.min(1.0e6) * GB as f64) as u64,
+            _ => return Err("memoryGb must be a number, 0 or more".into()),
+        };
         let lane = match request.get("lane") {
+            None | Some(Value::Null) => None,
             Some(lane @ Value::Obj(_)) => {
                 Some((part(lane, "repo", "")?, part(lane, "toolchain", "default")?))
             }
-            _ => None,
+            _ => return Err("lane must name a repo".into()),
         };
+        // A job's leases live while its process does, so the process must exist.
+        if let Some(pid) = request.get("pid") {
+            let alive =
+                matches!(pid, Value::Num(_)) && pid_of(request).is_some_and(lease::pid_alive);
+            if !alive {
+                return Err("pid must be a running process".into());
+            }
+        }
         let leased = paths(request, "leases")?;
         let kind = request.str("leaseKind").unwrap_or("cache").to_string();
         if kind == "delete" || !lease::KINDS.contains(&kind.as_str()) {
@@ -313,11 +400,25 @@ fn run(
         }
         Ok((holder, label, class, threads, memory, lane, leased, kind))
     })();
+    let deny = |stream: &mut UnixStream, holder: &str, reason: String| {
+        shared.event(vec![
+            ("event", s("refused")),
+            ("holder", s(holder)),
+            ("reason", s(&reason)),
+        ]);
+        refuse(stream, reason)
+    };
     let (holder, label, class, threads, memory, lane, leased, lease_kind) = match parsed {
         Ok(parsed) => parsed,
-        Err(reason) => return refuse(stream, reason),
+        Err(reason) => return deny(stream, request.str("holder").unwrap_or("unknown"), reason),
     };
     let pid = pid_of(request);
+    let lane_base = lane.as_ref().map(|(repo, toolchain)| {
+        lease::normalise(
+            &shared.layout.lanes().join(repo).join(toolchain),
+            Path::new("/"),
+        )
+    });
 
     let seq = {
         let mut state = shared.lock();
@@ -361,14 +462,20 @@ fn run(
             &me,
             ahead,
         );
+        // Read the leases once per pass; every check below uses this one reading.
+        let live = if matches!(decision, Decision::Admit { .. }) {
+            shared.store.live(now())
+        } else {
+            Vec::new()
+        };
         if matches!(decision, Decision::Admit { .. }) {
-            // Something this job depends on is being removed right now: wait for that.
-            let removing = leased.iter().find_map(|path| {
-                shared
-                    .store
-                    .blockers(path, now(), None)
-                    .into_iter()
-                    .find(|l| l.kind == "delete")
+            // Something this job depends on, or the folder its lanes live in, is being
+            // removed right now: wait for that.
+            let removing = live.iter().filter(|l| l.kind == "delete").find(|l| {
+                leased.iter().any(|path| l.covers(path))
+                    || lane_base.as_ref().is_some_and(|base| {
+                        l.paths.iter().any(|p| lease::within(base, Path::new(p)))
+                    })
             });
             if let Some(delete) = removing {
                 decision = Decision::Wait {
@@ -386,13 +493,14 @@ fn run(
                 let job = match start(
                     shared,
                     &mut state,
+                    &live,
                     seq,
                     &holder,
                     &label,
                     class,
                     threads,
                     memory,
-                    &lane,
+                    &lane_base,
                     &leased,
                     &lease_kind,
                     pid,
@@ -401,7 +509,7 @@ fn run(
                     Err(reason) => {
                         drop(state);
                         shared.changed.notify_all();
-                        return refuse(stream, reason);
+                        return deny(stream, &holder, reason);
                     }
                 };
                 break job;
@@ -410,12 +518,7 @@ fn run(
                 state.waiting.retain(|w| w.request.seq != seq);
                 drop(state);
                 shared.changed.notify_all();
-                shared.event(vec![
-                    ("event", s("refused")),
-                    ("holder", s(&holder)),
-                    ("reason", s(&reason)),
-                ]);
-                return refuse(stream, reason);
+                return deny(stream, &holder, reason);
             }
             Decision::Wait { reason } => {
                 if let Some(w) = state.waiting.iter_mut().find(|w| w.request.seq == seq) {
@@ -464,6 +567,7 @@ fn run(
     // The job runs for as long as the client keeps the connection open. Its last line
     // says how it ended; a connection that closes without one ended we know not how.
     let mut outcome = Value::Null;
+    let _ = stream.set_read_timeout(None);
     if told.is_ok() {
         while let Ok(Some(line)) = read_line(reader) {
             if line.str("op") == Some("done") {
@@ -509,13 +613,14 @@ type Started = (String, u32, Option<PathBuf>, Vec<String>);
 fn start(
     shared: &Arc<Shared>,
     state: &mut State,
+    live: &[Lease],
     seq: u64,
     holder: &str,
     label: &str,
     class: Class,
     threads: u32,
     memory: u64,
-    lane: &Option<(String, String)>,
+    lane_base: &Option<PathBuf>,
     leased: &[PathBuf],
     lease_kind: &str,
     pid: Option<u32>,
@@ -541,11 +646,7 @@ fn start(
     // One lane per running build: the lowest-numbered lane for this repository and
     // toolchain that no running job holds and nobody is removing.
     let mut lane_path = None;
-    if let Some((repo, toolchain)) = lane {
-        let base = lease::normalise(
-            &shared.layout.lanes().join(repo).join(toolchain),
-            Path::new("/"),
-        );
+    if let Some(base) = lane_base {
         let free = (0..4096u32)
             .map(|i| base.join(i.to_string()))
             .find(|candidate| {
@@ -553,7 +654,7 @@ fn start(
                     .running
                     .iter()
                     .any(|j| j.lane.as_ref() == Some(candidate))
-                    && shared.store.blockers(candidate, at, None).is_empty()
+                    && !live.iter().any(|l| l.covers(candidate))
             });
         let path = free.ok_or("no free lane")?;
         fs::create_dir_all(&path).map_err(|e| format!("cannot create lane {path:?}: {e}"))?;

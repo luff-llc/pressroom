@@ -8,6 +8,7 @@ use crate::lease::{self, DeleteRules, Store, Verdict};
 use crate::machine::{self, now, Layout};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,12 +19,24 @@ pub const TEMPFAIL: i32 = 75;
 pub const USAGE: i32 = 64;
 
 fn connect(layout: &Layout) -> Result<UnixStream, String> {
-    UnixStream::connect(layout.socket()).map_err(|_| {
-        format!(
-            "no pressroom daemon on this machine (looked for {}). Start one with: pressroom daemon",
-            layout.socket().display()
-        )
-    })
+    // A busy daemon can turn a connection away for a moment. Only a socket that is
+    // missing, or still refuses after a few tries, means there is no daemon.
+    let mut tries = 0;
+    loop {
+        match UnixStream::connect(layout.socket()) {
+            Ok(stream) => return Ok(stream),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50 * tries));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "no pressroom daemon on this machine (looked for {}). Start one with: pressroom daemon",
+                    layout.socket().display()
+                ))
+            }
+        }
+    }
 }
 
 fn ask(layout: &Layout, request: &Value) -> Result<Value, String> {
@@ -81,7 +94,16 @@ pub struct RunArgs {
 /// report how it ended. Returns the exit code for this process.
 pub fn run(layout: &Layout, args: RunArgs) -> i32 {
     let label = args.label.clone().unwrap_or_else(|| {
-        let mut text = args.command.join(" ");
+        // A script given on the command line may run over several lines.
+        let mut text: String = args
+            .command
+            .join(" ")
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if text.trim().is_empty() {
+            text = "work".into();
+        }
         text.truncate(text.char_indices().nth(160).map_or(text.len(), |(i, _)| i));
         text
     });
@@ -190,18 +212,27 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
             .env("PRESSROOM_LANE", lane)
             .env("CARGO_TARGET_DIR", Path::new(lane).join("target"));
     }
-    let exit = match command.status() {
-        Ok(status) => status.code().unwrap_or(1),
+    // Only what was there when the job started can have been removed under it.
+    let present: Vec<&String> = leases.iter().filter(|p| Path::new(p).exists()).collect();
+    let (exit, started) = match command.status() {
+        // A command ended by a signal reports 128 plus the signal, as a shell does.
+        Ok(status) => (
+            status
+                .code()
+                .or_else(|| status.signal().map(|sig| 128 + sig))
+                .unwrap_or(1),
+            true,
+        ),
         Err(e) => {
             eprintln!("pressroom: cannot start {}: {e}", args.command[0]);
-            127
+            (127, false)
         }
     };
 
     // Did anything this job leased vanish while it ran? That is the machine's fault.
-    let missing: Vec<String> = leases
-        .iter()
-        .filter(|p| !Path::new(p).exists())
+    let missing: Vec<String> = present
+        .into_iter()
+        .filter(|p| started && !Path::new(p).exists())
         .cloned()
         .collect();
     let done = obj(vec![

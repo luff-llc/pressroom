@@ -196,6 +196,9 @@ impl Parser<'_> {
                     }
                     self.space();
                     let item = self.value(depth + 1)?;
+                    if fields.iter().any(|(k, _)| *k == key) {
+                        return Err(format!("the key {key:?} appears twice"));
+                    }
                     fields.push((key, item));
                     self.space();
                     if self.eat(",") {

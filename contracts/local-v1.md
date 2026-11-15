@@ -2,7 +2,8 @@
 
 What the daemon on one machine promises to the things on that machine: agents and people
 who run work, and tools that clean up. Version `pressroom.local/1`; lease files are
-`pressroom.lease/1`. Tested by `tests/end_to_end.rs`.
+`pressroom.lease/1`. Tested by `tests/end_to_end.rs`. Checked once by a separate agent on
+2026-11-15; what it found and what was done is in `docs/review/2026-11-15-slice-1.md`.
 
 This covers one machine. Heartbeats to Galley, enrolment, grants and power are later
 contracts.
@@ -15,6 +16,7 @@ Everything is under `$PRESSROOM_HOME`, else `~/.pressroom`, readable by its user
 |---|---|
 | `machine.conf` | What the owner declared. `key = value` lines. An unknown key or a bad value stops the daemon; it never falls back to a looser limit. |
 | `sock` | The daemon's socket, mode 600 |
+| `daemon.pid` | The running daemon's process. One daemon per home; a second refuses to start. |
 | `leases/<id>.json` | One file per live lease |
 | `lanes/<repo>/<toolchain>/<n>/` | Cache lanes |
 | `checkouts/`, `scratch/`, `results/` | Other managed folders |
@@ -34,6 +36,9 @@ Everything is under `$PRESSROOM_HOME`, else `~/.pressroom`, readable by its user
 | `grace_hours` | `24` | A path changed more recently than this is not removable |
 | `managed` | | A further folder a cleanup tool may touch. Repeatable. |
 
+A `#` starts a comment at the start of a line or after a space. The daemon reads
+`machine.conf` when it starts; restart it after a change.
+
 Whether a person is present is measured on macOS only. Where it cannot be told, a
 workstation counts its person as present.
 
@@ -50,7 +55,8 @@ workstation counts its person as present.
 4. Work asking for more memory than the offer is refused, not queued.
 5. Waiting work is ordered by class (`waiting`, then `gate`, then `batch`), then by
    arrival. Only the first in line may be admitted.
-6. Every wait has a reason in plain words, shown to the asker and in `status`.
+6. Every wait has a reason in plain words, shown to the asker and in `status`. An asker
+   that stays connected but stops reading for two seconds loses its place in line.
 7. With no daemon, `run` does not run the command. It exits 69.
 
 **Lanes.**
@@ -63,11 +69,14 @@ workstation counts its person as present.
 
 10. A lease names paths, a holder, a kind and an end. It is live until its end time, and,
     if it names a process, only while that process exists.
-11. A lease covers a path that is a leased path, is inside one, or contains one.
+11. A lease covers a path that is a leased path, is inside one, or contains one. Paths
+    are compared after symbolic links and `..` are resolved the way the system resolves
+    them. On macOS, case is ignored.
 12. A job's leases (its lane, and what it named with `--lease`) are written before the
-    command starts and removed when the job ends. They name the `run` process, so they
-    also end if it dies. They cannot be released from outside the job.
-13. A path being removed (rule 17) cannot be leased, and a job that depends on it waits.
+    command starts and removed when the job ends, however long it runs. They name the
+    `run` process, which must exist when the job is admitted, so they also end if it dies. They cannot be released from outside the job.
+13. A path being removed (rule 17) cannot be leased. A job that depends on it, or whose
+    lanes are inside it, waits.
 
 **Cleanup.** A tool may remove a path only if all of these hold:
 
@@ -78,15 +87,16 @@ workstation counts its person as present.
     at that moment and under the same lock as admission.
 
 If any lease file cannot be read, every removal is refused until the file is fixed or
-removed: it might be the lease on that path.
+removed: it might be the lease on that path. Unreadable includes a path with `.` or `..`
+in it and the same key written twice.
 
 `may-delete` checks 14 to 16 from the files alone and needs no daemon. It is for asking.
 A tool that is about to remove something uses `delete-begin`.
 
 **When something leased vanishes anyway.**
 
-18. After the command ends, `run` checks that each path it leased with `--lease` still
-    exists. If one is gone it says so, the daemon records `leased_path_removed`, and if
+18. After the command ends, `run` checks each path it leased with `--lease` that existed
+    when the command started. If one is gone it says so, the daemon records `leased_path_removed`, and if
     the command also failed, `run` exits 75 in place of the command's own code: a fault
     of the machine, not of the code.
 
@@ -125,17 +135,19 @@ One JSON object per line. The first line from the client names an `op`.
 | `delete-begin` | `holder`, `paths` (one), `ttlSecs`, optional `pid` | `{"ok":true,"id","expires"}`, or refused with the reason |
 | `delete-end` | `id` | `{"ok":true,"existed"}` |
 
-A refusal is `{"ok":false,"state":"refused","reason":"..."}`.
+A refusal is `{"ok":false,"state":"refused","reason":"..."}`. A request that cannot be
+read, or has a field of the wrong type, is refused in the same way; no field is quietly
+replaced by a default. A connection that sends nothing for ten seconds is closed.
 
 ## Exit codes of `pressroom run`
 
 | Code | Meaning |
 |---|---|
-| the command's own | It ran |
+| the command's own | It ran. A command ended by a signal gives 128 plus the signal. |
 | 64 | Wrong arguments |
 | 69 | No daemon, or refused |
 | 75 | The command failed and something it leased had been removed |
-| 127 | The command could not be started |
+| 127 | The command could not be started (126 or 127 for batch work, which starts through `nice`) |
 
 ## What version 1 does not do
 
@@ -145,11 +157,16 @@ A refusal is `{"ok":false,"state":"refused","reason":"..."}`.
   `PRESSROOM_THREADS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `MAKEFLAGS` and
   `CMAKE_BUILD_PARALLEL_LEVEL`, and lowers the priority of batch work. A command that
   ignores these uses what it likes. Xcode needs `-jobs "$PRESSROOM_THREADS"`.
+- **Rule 18 cannot tell who removed a path.** A job that removes what it leased and then
+  fails is also reported as a fault of the machine.
 - **A `run` that is killed outright frees its place at once,** even if the command it
   started is still going.
-- **Holders are labels.** Anything running as the daemon's user can use the socket.
+- **Holders are labels.** Anything running as the daemon's user can use the socket, and
+  the process a job names is taken on trust beyond being alive.
   Identity and grants come with enrolment.
 - **It does not judge "stuck".** `status` shows how long a job has run and how busy the
   machine is.
 - **The grace time looks at the path itself,** not at everything inside it.
+- **Many idle connections can use up the daemon's file handles** for up to ten seconds.
+- **Linux is untested.** Everything so far ran on macOS.
 - No heartbeat to Galley, no power, no energy figure, no data classes.

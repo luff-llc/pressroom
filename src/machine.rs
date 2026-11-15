@@ -87,7 +87,14 @@ pub fn load_config(layout: &Layout, total_memory: u64) -> Result<Config, String>
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
     for (i, line) in text.lines().enumerate() {
-        let line = line.split('#').next().unwrap_or("").trim();
+        // A comment starts with `#` at the start of a line or after a space, so a `#`
+        // inside a path is part of the path.
+        let line = match line.find(" #").or_else(|| line.find("\t#")) {
+            _ if line.trim_start().starts_with('#') => "",
+            Some(at) => &line[..at],
+            None => line,
+        }
+        .trim();
         if line.is_empty() {
             continue;
         }
@@ -189,12 +196,16 @@ pub fn parse_meminfo(text: &str) -> Option<u64> {
 }
 
 fn load1() -> f64 {
-    // For tests only: a fixed load, so that a busy machine does not change their result.
-    if let Some(fixed) = std::env::var("PRESSROOM_TEST_LOAD")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    // Debug builds only, for tests: a fixed load, so that a busy machine does not change
+    // their result.
+    #[cfg(debug_assertions)]
     {
-        return fixed;
+        if let Some(fixed) = std::env::var("PRESSROOM_TEST_LOAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            return fixed;
+        }
     }
     if let Ok(text) = fs::read_to_string("/proc/loadavg") {
         return parse_load(&text).unwrap_or(0.0);
@@ -337,6 +348,9 @@ mod tests {
         assert_eq!(c.limits.disk_floor, 30 * GB);
         assert_eq!(c.grace_secs, 12 * 3600);
         assert_eq!(c.managed.len(), 5);
+        fs::write(layout.config(), "managed = /srv/ci#keep\n").unwrap();
+        let c = load_config(&layout, GB).unwrap();
+        assert!(c.managed[4].to_string_lossy().ends_with("ci#keep"));
 
         for bad in [
             "share_present = 1.5",
