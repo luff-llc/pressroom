@@ -1,0 +1,11 @@
+# Example only. A systemd user unit: ~/.config/systemd/user/pressroom.service
+# Nothing installs it.
+[Unit]
+Description=Pressroom gatekeeper
+
+[Service]
+ExecStart=%h/.local/bin/pressroom daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

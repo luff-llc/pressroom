@@ -1,0 +1,13 @@
+[package]
+name = "pressroom"
+version = "0.1.0"
+edition = "2021"
+description = "The machines agents run work on: one gatekeeper per machine."
+publish = false
+
+# No dependencies. Anything added goes on the allowlist in docs/references.md first,
+# with its licence and version.
+[dependencies]
+
+[profile.release]
+opt-level = 2
