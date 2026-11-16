@@ -149,25 +149,32 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
     };
 
     let mut last_reason = String::new();
+    // When a daemon was last lost without any answer since.
+    let mut unanswered_since: Option<std::time::Instant> = None;
     let admitted = loop {
         let mut reply = String::new();
         match reader.read_line(&mut reply) {
             Ok(0) | Err(_) => {
                 // The daemon stopped, most often to be replaced by a newer one. Work that
                 // was only waiting has lost nothing: join the new daemon's line (rule 22).
+                //
+                // The two minutes run from when a daemon last answered, not from each lost
+                // connection: one that accepts and hangs up, over and over, is no daemon.
                 eprintln!("pressroom: the daemon went away while this was waiting; rejoining");
-                let until = std::time::Instant::now() + REJOIN_FOR;
+                let until =
+                    *unanswered_since.get_or_insert_with(std::time::Instant::now) + REJOIN_FOR;
                 let rejoined = loop {
+                    if std::time::Instant::now() >= until {
+                        break None;
+                    }
                     std::thread::sleep(std::time::Duration::from_secs(1));
-                    match join(layout, &line) {
-                        Ok(joined) => break Some(joined),
-                        Err(_) if std::time::Instant::now() < until => {}
-                        Err(_) => break None,
+                    if let Ok(joined) = join(layout, &line) {
+                        break Some(joined);
                     }
                 };
                 let Some(joined) = rejoined else {
                     eprintln!(
-                        "pressroom: no daemon came back within {} seconds",
+                        "pressroom: no daemon answered within {} seconds",
                         REJOIN_FOR.as_secs()
                     );
                     return UNAVAILABLE;
@@ -176,7 +183,7 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
                 last_reason.clear();
                 continue;
             }
-            Ok(_) => {}
+            Ok(_) => unanswered_since = None,
         }
         let Ok(reply) = json::parse(reply.trim()) else {
             eprintln!("pressroom: bad reply from the daemon");
