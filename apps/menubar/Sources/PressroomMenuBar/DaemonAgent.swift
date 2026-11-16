@@ -27,8 +27,17 @@ final class DaemonAgent {
         status = service.status
     }
 
-    /// Only an installed app that carries the daemon can register it.
-    var isAvailable: Bool { LoginItem.isInstalledApp && service.status != .notFound }
+    /// Only an installed app that carries the daemon can register it. Checked on disk: for an
+    /// agent never registered, SMAppService reports `.notFound` as well as for a missing one.
+    var isAvailable: Bool {
+        let agent = Bundle.main.bundleURL
+            .appending(path: "Contents/Library/LaunchAgents/\(Self.plistName)")
+        return LoginItem.isInstalledApp
+            && FileManager.default.fileExists(atPath: agent.path(percentEncoded: false))
+            && FileManager.default.isExecutableFile(
+                atPath: Bundle.main.bundleURL.appending(path: "Contents/MacOS/pressroom")
+                    .path(percentEncoded: false))
+    }
     var isOn: Bool { status == .enabled || status == .requiresApproval }
     var needsApproval: Bool { status == .requiresApproval }
 
