@@ -36,8 +36,11 @@ pressroom run --threads 4 --memory-gb 4 --lane pressroom-menubar -- swift test
 pressroom run --threads 4 --memory-gb 4 --lane pressroom-menubar -- scripts/bundle.sh
 ```
 
-`scripts/bundle.sh` writes `build/Pressroom.app`, signed ad hoc. Copy it to
-`~/Applications` to keep it.
+`scripts/bundle.sh` writes `build/Pressroom.app` and signs it with `scripts/sign.sh`: as
+LUFF LLC's Developer ID (hardened runtime) where the keychain has it, otherwise ad hoc. Build
+anywhere, then sign on a Mac that holds the identity: `scripts/sign.sh path/to/Pressroom.app`.
+Copy it to `~/Applications` to keep it. It is not notarized yet, so a copy downloaded from
+the internet is refused by Gatekeeper; a copy made locally runs.
 
 `PressroomKit` holds the socket client and the status decoding; its tests use a fake
 daemon on a scratch socket and synthetic fixtures.
