@@ -16,7 +16,7 @@ Everything is under `$PRESSROOM_HOME`, else `~/.pressroom`, readable by its user
 |---|---|
 | `machine.conf` | What the owner declared. `key = value` lines. An unknown key or a bad value stops the daemon; it never falls back to a looser limit. |
 | `sock` | The daemon's socket, mode 600 |
-| `daemon.pid` | The running daemon's process. One daemon per home; a second refuses to start. |
+| `daemon.pid` | The running daemon's process. One daemon per home; a second refuses to start and exits 1, or 0 with `--if-not-running` (for login agents, which must not retry). |
 | `leases/<id>.json` | One file per live lease |
 | `lanes/<repo>/<toolchain>/<n>/` | Cache lanes |
 | `checkouts/`, `scratch/`, `results/` | Other managed folders |

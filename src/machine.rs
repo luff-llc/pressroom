@@ -365,8 +365,7 @@ pub fn tool_dirs(path: Option<&str>, home: Option<&Path>) -> Vec<PathBuf> {
             let mut found: Vec<PathBuf> = fs::read_dir(home.join(parent))
                 .map(|entries| entries.flatten().map(|e| e.path().join(child)).collect())
                 .unwrap_or_default();
-            found.sort();
-            found.reverse();
+            found.sort_by_key(|p| std::cmp::Reverse(version_key(p)));
             more.extend(found);
         }
     }
@@ -377,6 +376,40 @@ pub fn tool_dirs(path: Option<&str>, home: Option<&Path>) -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// Sort key for a version folder name: runs of digits compare as numbers, so `1.100` is
+/// newer than `1.99` and `v22` than `v9`.
+fn version_key(path: &Path) -> Vec<(u64, String)> {
+    let name = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut key = Vec::new();
+    let mut digits = String::new();
+    let mut other = String::new();
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            if !other.is_empty() {
+                key.push((0, std::mem::take(&mut other)));
+            }
+            digits.push(c);
+        } else {
+            if !digits.is_empty() {
+                key.push((digits.parse().unwrap_or(u64::MAX), String::new()));
+                digits.clear();
+            }
+            other.push(c);
+        }
+    }
+    if !digits.is_empty() {
+        key.push((digits.parse().unwrap_or(u64::MAX), String::new()));
+    }
+    if !other.is_empty() {
+        key.push((0, other));
+    }
+    key
 }
 
 pub fn toolchains() -> Vec<(String, String)> {
@@ -420,7 +453,12 @@ mod tests {
     fn tools_are_looked_for_beyond_the_path() {
         let home = std::env::temp_dir().join(format!("pr-tools-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
-        for dir in [".rustup/toolchains/1.98.0-x/bin", ".rustup/toolchains/1.99.1-x/bin"] {
+        for dir in [
+            ".rustup/toolchains/1.98.0-x/bin",
+            ".rustup/toolchains/1.99.1-x/bin",
+            ".nvm/versions/node/v9.0.0/bin",
+            ".nvm/versions/node/v22.1.0/bin",
+        ] {
             fs::create_dir_all(home.join(dir)).unwrap();
         }
         let dirs = tool_dirs(Some("/usr/bin:/bin:/usr/bin"), Some(&home));
@@ -432,6 +470,9 @@ mod tests {
         let newest = dirs.iter().position(|d| d.ends_with("1.99.1-x/bin")).unwrap();
         let older = dirs.iter().position(|d| d.ends_with("1.98.0-x/bin")).unwrap();
         assert!(cargo < newest && newest < older, "{dirs:?}");
+        let v22 = dirs.iter().position(|d| d.ends_with("v22.1.0/bin")).unwrap();
+        let v9 = dirs.iter().position(|d| d.ends_with("v9.0.0/bin")).unwrap();
+        assert!(v22 < v9, "numbers compare as numbers: {dirs:?}");
         assert!(dirs.contains(&home.join(".local/share/mise/shims")));
         let _ = fs::remove_dir_all(&home);
     }

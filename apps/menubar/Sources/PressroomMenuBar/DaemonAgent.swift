@@ -12,6 +12,7 @@ import ServiceManagement
 final class DaemonAgent {
     static let plistName = "works.luff.pressroom.daemon.plist"
     private static let defaultApplied = "daemonAgentDefaultApplied"
+    private static let registeredVersion = "daemonAgentRegisteredVersion"
 
     private(set) var status: SMAppService.Status
     private(set) var error: String?
@@ -31,10 +32,30 @@ final class DaemonAgent {
     var isOn: Bool { status == .enabled || status == .requiresApproval }
     var needsApproval: Bool { status == .requiresApproval }
 
+    /// The app's version: an update replaces the agent's program, which must then be
+    /// registered again or launchd may stop starting it.
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
+    }
+
     func applyDefault() async {
-        guard isAvailable, !defaults.bool(forKey: Self.defaultApplied) else { return }
-        defaults.set(true, forKey: Self.defaultApplied)
-        if await !daemonAnswers() { await set(true) }
+        guard isAvailable else { return }
+        if !defaults.bool(forKey: Self.defaultApplied) {
+            defaults.set(true, forKey: Self.defaultApplied)
+            if await !daemonAnswers() { await set(true) }
+            return
+        }
+        if isOn, defaults.string(forKey: Self.registeredVersion) != appVersion {
+            do {
+                try await service.unregister()
+                try service.register()
+                defaults.set(appVersion, forKey: Self.registeredVersion)
+                error = nil
+            } catch {
+                self.error = error.localizedDescription
+            }
+            status = service.status
+        }
     }
 
     func set(_ on: Bool) async {
@@ -45,8 +66,10 @@ final class DaemonAgent {
                     return
                 }
                 try service.register()
+                defaults.set(appVersion, forKey: Self.registeredVersion)
             } else {
                 try await service.unregister()
+                defaults.removeObject(forKey: Self.registeredVersion)
             }
             error = nil
         } catch {

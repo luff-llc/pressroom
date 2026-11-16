@@ -13,8 +13,9 @@ use std::process::exit;
 const HELP: &str = "\
 pressroom: the gatekeeper for work on this machine
 
-  pressroom daemon
-      Run the gatekeeper. One per machine, as the user that runs the work.
+  pressroom daemon [--if-not-running]
+      Run the gatekeeper. One per machine, as the user that runs the work. A second one
+      refuses and exits 1; with --if-not-running it exits 0 instead (for login agents).
 
   pressroom run [options] -- COMMAND [ARGS...]
       Wait to be admitted, then run COMMAND within what was granted.
@@ -102,13 +103,22 @@ fn main() {
     };
     let rest = &args[1..];
     let code = match command.as_str() {
-        "daemon" => match daemon::serve(layout.home) {
-            Ok(()) => 0,
-            Err(why) => {
-                eprintln!("pressroom: {why}");
-                1
+        "daemon" => {
+            let (options, _) = split(rest, &["--if-not-running"], &[]);
+            match daemon::serve(layout.home) {
+                Ok(()) => 0,
+                // Started at login beside a daemon that already runs: nothing to do, and
+                // nothing for launchd to restart.
+                Err(daemon::ServeError::AlreadyRunning(why)) if !options.is_empty() => {
+                    eprintln!("pressroom: {why}; leaving it be");
+                    0
+                }
+                Err(daemon::ServeError::AlreadyRunning(why) | daemon::ServeError::Failed(why)) => {
+                    eprintln!("pressroom: {why}");
+                    1
+                }
             }
-        },
+        }
         "run" => {
             let valued = [
                 "--threads",

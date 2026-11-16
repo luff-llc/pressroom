@@ -689,6 +689,14 @@ fn one_daemon_per_home() {
         .unwrap();
     assert!(!second.status.success());
     assert!(text(&second.stderr).contains("already running"));
+    // A login agent asks it to leave a running daemon be, and gets success, not a retry.
+    let polite = Command::new(BIN)
+        .args(["daemon", "--if-not-running"])
+        .env("PRESSROOM_HOME", &m.home)
+        .output()
+        .unwrap();
+    assert!(polite.status.success(), "{}", text(&polite.stderr));
+    assert!(text(&polite.stderr).contains("already running"));
     assert!(
         m.cmd(&["status"]).status.success(),
         "the first daemon still answers"
