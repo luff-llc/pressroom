@@ -23,23 +23,36 @@ impl Machine {
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("machine.conf"), conf(&home)).unwrap();
-        let daemon = Command::new(BIN)
+        let daemon = Machine::daemon(&home);
+        let machine = Machine { home, daemon };
+        machine.wait_until_up();
+        machine
+    }
+    fn daemon(home: &Path) -> Child {
+        Command::new(BIN)
             .arg("daemon")
-            .env("PRESSROOM_HOME", &home)
+            .env("PRESSROOM_HOME", home)
             .env("PRESSROOM_TEST_LOAD", "0")
             .env("PRESSROOM_TEST_REPORT_SECS", "1")
             .env("PRESSROOM_TEST_SENDER_SECS", "2")
             .env("SECRET_IN_THE_DAEMONS_ENV", "must-not-reach-the-sender")
             .stderr(Stdio::null())
             .spawn()
-            .unwrap();
-        let machine = Machine { home, daemon };
+            .unwrap()
+    }
+    fn wait_until_up(&self) {
         let until = Instant::now() + Duration::from_secs(10);
-        while !machine.cmd(&["status", "--json"]).status.success() {
+        while !self.cmd(&["status", "--json"]).status.success() {
             assert!(Instant::now() < until, "daemon did not start");
             std::thread::sleep(Duration::from_millis(50));
         }
-        machine
+    }
+    /// Kill the daemon as an upgrade does, and start another on the same home.
+    fn restart(&mut self) {
+        self.daemon.kill().unwrap();
+        self.daemon.wait().unwrap();
+        self.daemon = Machine::daemon(&self.home);
+        self.wait_until_up();
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(BIN);
@@ -489,8 +502,8 @@ fn first_line(stream: std::os::unix::net::UnixStream) -> String {
 #[test]
 fn a_client_that_stops_reading_does_not_hold_the_queue() {
     let m = Machine::start("stall", ONE_THREAD);
-    let holding = m
-        .command(&["run", "--label", "holding", "--", "sleep", "3"])
+    let mut holding = m
+        .command(&["run", "--label", "holding", "--", "sleep", "60"])
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
@@ -507,14 +520,25 @@ fn a_client_that_stops_reading_does_not_hold_the_queue() {
         .spawn()
         .unwrap();
     m.wait_for("behind queued", |s| s.contains("\"label\":\"behind\""));
-    // Fill the stalled client's buffer: every change makes the daemon write to it.
-    for _ in 0..3000 {
-        drop(raw(&m, r#"{"op":"release","id":"zz"}"#));
+    // Every change makes the daemon write to the stalled client. Keep making changes
+    // until its buffer is full and the daemon, unable to tell it anything, drops it from
+    // the line while it is still connected. How many changes that takes depends on the
+    // system's socket buffers and on how many changes one write covers, so count on
+    // neither: go on until it has happened.
+    let until = Instant::now() + Duration::from_secs(40);
+    while m.status().contains("\"label\":\"stalled\"") {
+        assert!(
+            Instant::now() < until,
+            "a client that stopped reading is still in the line:\n{}",
+            m.status()
+        );
+        for _ in 0..200 {
+            drop(raw(&m, r#"{"op":"release","id":"zz"}"#));
+        }
     }
-    let mut holding = holding;
-    assert!(holding.wait().unwrap().success());
-    // The stalled client's buffer is full, so the daemon cannot tell it anything. It
-    // must be dropped from the line while it is still connected, not waited on.
+    // The place frees: the one behind runs, not the stalled one.
+    holding.kill().unwrap();
+    holding.wait().unwrap();
     let mut behind = behind;
     let until = Instant::now() + Duration::from_secs(20);
     loop {
@@ -530,6 +554,32 @@ fn a_client_that_stops_reading_does_not_hold_the_queue() {
         std::thread::sleep(Duration::from_millis(100));
     }
     drop(stalled);
+}
+
+#[test]
+fn waiting_work_rejoins_the_line_when_the_daemon_is_replaced() {
+    let mut m = Machine::start("rejoin", ONE_THREAD);
+    let mut holding = m
+        .command(&["run", "--label", "holding", "--", "sleep", "5"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    m.wait_for("holding running", |s| s.contains("\"usedThreads\":1"));
+    let behind = m
+        .command(&["run", "--label", "behind", "--", "echo", "ran"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    m.wait_for("behind queued", |s| s.contains("\"label\":\"behind\""));
+    m.restart();
+    // The one that was waiting did not fail: it joined the new daemon's line and ran.
+    let out = behind.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "ran");
+    assert!(text(&out.stderr).contains("rejoining"), "{}", text(&out.stderr));
+    // The one that was running was not disturbed.
+    assert!(holding.wait().unwrap().success());
 }
 
 #[test]

@@ -63,6 +63,9 @@ pub struct Measured {
     pub memory: u64,
     pub disk_free: u64,
     pub load1: f64,
+    /// Threads' worth of processor in use over the last few seconds, by anything. `None`
+    /// when it can't be measured; the load average stands in then.
+    pub busy: Option<f64>,
     /// Seconds since the person last touched the machine. `None` when it can't be told.
     pub idle_secs: Option<u64>,
 }
@@ -178,9 +181,21 @@ pub struct InUse {
 
 /// Load on the machine that pressroom did not admit: a build someone started outside it,
 /// or the person's own work. Rounded to whole threads.
+///
+/// It is worked out from the processor actually in use. The load average also counts
+/// threads that are waiting on something else, and on a desktop it runs several times
+/// above what the processor is doing, so it is used only where use cannot be measured.
 pub fn outside_load(m: &Measured, in_use: InUse) -> u32 {
-    let load = m.load1.max(0.0).round() as u32;
+    let load = m.busy.unwrap_or(m.load1).max(0.0).round() as u32;
     load.saturating_sub(in_use.threads)
+}
+
+/// The figure admission goes by, said for a person.
+fn load_said(m: &Measured) -> String {
+    match m.busy {
+        Some(busy) => format!("{busy:.1} of {} threads busy", m.threads),
+        None => format!("load {:.1}", m.load1),
+    }
 }
 
 /// Threads free for new work: what is left of the offer, and never more than what is left
@@ -252,8 +267,10 @@ pub fn decide(
         let reason = if b.threads.saturating_sub(in_use.threads) >= want.div_ceil(2) {
             format!(
                 "machine is busy with work not started through pressroom \
-                 (load {:.1}; {} of {} threads offered{who})",
-                m.load1, b.threads, m.threads
+                 ({}; {} of {} threads offered{who})",
+                load_said(m),
+                b.threads,
+                m.threads
             )
         } else {
             format!(
@@ -318,6 +335,7 @@ mod tests {
             memory: 64 * GB,
             disk_free: 100 * GB,
             load1,
+            busy: None,
             idle_secs: idle,
         }
     }
@@ -490,6 +508,34 @@ mod tests {
         assert_eq!(free_threads(16, 8, 0, 16), 0);
         // With every thread offered there is no kept share to absorb it.
         assert_eq!(free_threads(16, 16, 0, 5), 11);
+        // Processor use is what counts where it can be measured: a load average of 20
+        // with a third of the processor in use (a desktop, 16 November) holds nothing.
+        let mut desktop = macbook(Some(10), 20.3);
+        desktop.busy = Some(5.8);
+        assert_eq!(outside_load(&desktop, InUse::default()), 6);
+        assert_eq!(
+            decide(
+                &l,
+                &desktop,
+                Said::Nothing,
+                InUse::default(),
+                &req(0, Class::Waiting, 4, 1),
+                0
+            ),
+            Decision::Admit { threads: 4 }
+        );
+        desktop.busy = Some(15.6);
+        match decide(
+            &l,
+            &desktop,
+            Said::Nothing,
+            InUse::default(),
+            &req(0, Class::Waiting, 4, 1),
+            0,
+        ) {
+            Decision::Wait { reason } => assert!(reason.contains("15.6 of 16 threads busy")),
+            other => panic!("{other:?}"),
+        }
         // Our own admitted work is not counted twice.
         let used = InUse {
             threads: 4,

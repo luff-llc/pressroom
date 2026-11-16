@@ -1038,6 +1038,13 @@ fn status(shared: &Arc<Shared>) -> Value {
         ("usedMemoryGb", n(in_use.memory as f64 / GB as f64)),
         ("load1", n(state.measured.load1)),
         (
+            "busyThreads",
+            state
+                .measured
+                .busy
+                .map_or(Value::Null, |b| n((b * 10.0).round() / 10.0)),
+        ),
+        (
             "outsideLoad",
             n(admit::outside_load(&state.measured, in_use)),
         ),
