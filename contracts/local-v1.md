@@ -50,8 +50,10 @@ workstation counts its person as present.
 1. The machine offers a number of threads (its threads times the share that applies,
    at least one, or none while its person holds it, rule 19) and an amount of memory
    (its memory less the reserve).
-2. Work is admitted only while what is already admitted, plus load on the machine that
-   pressroom did not admit, plus the new work, fits the offer.
+2. Work is admitted only while what is already admitted plus the new work fits the offer,
+   and while those plus load on the machine that pressroom did not admit fit the machine.
+   So outside load is taken first from the threads the machine keeps back (its person's
+   share), and comes off the offer only once it passes them.
 3. Work asking for more threads than the offer is given the offer. Work is given what is
    free if that is at least half of what it asked. It is never given more than is free.
 4. Work asking for more memory than the offer is refused, not queued.
@@ -191,8 +193,10 @@ replaced by a default. A connection that sends nothing for ten seconds is closed
 
 ## What version 1 does not do
 
-- **It cannot stop work started outside it.** It counts that load against the offer and
-  shows it in `status`, so its own work backs off.
+- **It cannot stop work started outside it.** It counts that load against the machine
+  (rule 2) and shows it in `status`, with the programs using the most processor, so its
+  own work backs off when the machine is full. Load is the one-minute load average, which
+  runs higher than processor use on a busy desktop.
 - **It does not cap a running job.** It tells the job how many threads to use through
   `PRESSROOM_THREADS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `MAKEFLAGS` and
   `CMAKE_BUILD_PARALLEL_LEVEL`, and lowers the priority of batch work. A command that
