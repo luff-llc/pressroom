@@ -1,0 +1,72 @@
+import Foundation
+import Observation
+import PressroomKit
+import ServiceManagement
+
+/// Whether the daemon bundled in the app starts at login, as a LaunchAgent registered with
+/// SMAppService. A setting with a default: on, applied once when an installed app first finds
+/// no daemon answering. A Mac whose daemon was started another way keeps that one, and the
+/// app never starts a second.
+@MainActor
+@Observable
+final class DaemonAgent {
+    static let plistName = "works.luff.pressroom.daemon.plist"
+    private static let defaultApplied = "daemonAgentDefaultApplied"
+
+    private(set) var status: SMAppService.Status
+    private(set) var error: String?
+
+    private let service = SMAppService.agent(plistName: DaemonAgent.plistName)
+    private let client: PressroomClient
+    private let defaults: UserDefaults
+
+    init(client: PressroomClient, defaults: UserDefaults = .standard) {
+        self.client = client
+        self.defaults = defaults
+        status = service.status
+    }
+
+    /// Only an installed app that carries the daemon can register it.
+    var isAvailable: Bool { LoginItem.isInstalledApp && service.status != .notFound }
+    var isOn: Bool { status == .enabled || status == .requiresApproval }
+    var needsApproval: Bool { status == .requiresApproval }
+
+    func applyDefault() async {
+        guard isAvailable, !defaults.bool(forKey: Self.defaultApplied) else { return }
+        defaults.set(true, forKey: Self.defaultApplied)
+        if await !daemonAnswers() { await set(true) }
+    }
+
+    func set(_ on: Bool) async {
+        do {
+            if on {
+                if !isOn, await daemonAnswers() {
+                    error = "A Pressroom daemon is already running on this Mac, started another way. Stop it first."
+                    return
+                }
+                try service.register()
+            } else {
+                try await service.unregister()
+            }
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+        status = service.status
+    }
+
+    func openSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+
+    private func daemonAnswers() async -> Bool {
+        do {
+            _ = try await client.status()
+            return true
+        } catch PressroomError.notRunning {
+            return false
+        } catch {
+            return true
+        }
+    }
+}

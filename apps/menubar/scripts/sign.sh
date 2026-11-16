@@ -10,10 +10,15 @@ identity=${PRESSROOM_SIGN_IDENTITY:-}
 if [ -z "$identity" ] && security find-identity -v -p codesigning | grep -qF "\"$luff\""; then
     identity=$luff
 fi
+daemon="$app/Contents/MacOS/pressroom"
 if [ -z "$identity" ] || [ "$identity" = "-" ]; then
     echo "sign.sh: no LUFF LLC Developer ID on this Mac; signing ad hoc (fine on this Mac only)" >&2
+    [ -f "$daemon" ] && codesign --force --sign - --timestamp=none --identifier works.luff.pressroom "$daemon"
     codesign --force --sign - --timestamp=none "$app"
 else
+    # Nested code first, then the app around it.
+    [ -f "$daemon" ] && codesign --force --options runtime --timestamp \
+        --identifier works.luff.pressroom --sign "$identity" "$daemon"
     codesign --force --options runtime --timestamp --sign "$identity" "$app"
 fi
 codesign --verify --strict "$app"

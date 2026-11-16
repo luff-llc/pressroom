@@ -168,7 +168,7 @@ One object. Numbers in GB may have fractions; seconds are whole.
 | `usedThreads`, `usedMemoryGb` | What admitted work holds |
 | `load1`, `outsideLoad` | Load average, and the whole threads of it pressroom did not admit |
 | `diskFreeGb`, `diskFloorGb` | Free disk and the floor below which nothing new starts |
-| `toolchains` | `[{"name","version"}]` |
+| `toolchains` | `[{"name","version"}]`, for `rustc`, `cargo`, `bun`, `node` and `xcode`: the first copy that answers, on the daemon's PATH, then in `/opt/homebrew/bin`, `/usr/local/bin`, and under the home folder `.local/bin`, `.cargo/bin`, `.local/share/mise/shims`, `.bun/bin`, and the newest `.rustup/toolchains/*/bin` and `.nvm/versions/node/*/bin` |
 | `managed` | The managed folders |
 | `running` | `[{"job","holder","label","class","threads","memoryGb","lane","pid","forSecs"}]`; `lane` and `pid` may be null |
 | `waiting` | `[{"holder","label","class","threads","reason","forSecs"}]`, in the order they will be admitted |

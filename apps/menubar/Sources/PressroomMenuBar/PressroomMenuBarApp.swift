@@ -8,23 +8,28 @@ import SwiftUI
 struct PressroomMenuBarApp: App {
     @State private var model: StatusModel
     @State private var loginItem: LoginItem
+    @State private var daemonAgent: DaemonAgent
 
     init() {
         // No Dock icon, also when run outside the app bundle.
         NSApplication.shared.setActivationPolicy(.accessory)
-        let model = StatusModel(client: PressroomClient(), holder: "user:\(NSUserName())")
+        let client = PressroomClient()
+        let model = StatusModel(client: client, holder: "user:\(NSUserName())")
         model.start()
         _model = State(initialValue: model)
         let loginItem = LoginItem()
         _loginItem = State(initialValue: loginItem)
+        let daemonAgent = DaemonAgent(client: client)
+        _daemonAgent = State(initialValue: daemonAgent)
+        Task { await daemonAgent.applyDefault() }
         if CommandLine.arguments.contains("--window") {
-            PanelWindow.open(model: model, loginItem: loginItem)
+            PanelWindow.open(model: model, loginItem: loginItem, daemonAgent: daemonAgent)
         }
     }
 
     var body: some Scene {
         MenuBarExtra {
-            StatusPanel(model: model, loginItem: loginItem)
+            StatusPanel(model: model, loginItem: loginItem, daemonAgent: daemonAgent)
         } label: {
             MenuBarLabel(phase: model.phase)
         }

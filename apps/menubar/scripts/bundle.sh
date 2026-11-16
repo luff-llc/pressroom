@@ -15,5 +15,12 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp "$bin" "$app/Contents/MacOS/PressroomMenuBar"
 cp Resources/Info.plist "$app/Contents/Info.plist"
+# With PRESSROOM_DAEMON pointing at a built `pressroom`, the app carries the daemon and the
+# LaunchAgent that runs it (registered by the app, scripts/release.sh sets this).
+if [ -n "${PRESSROOM_DAEMON:-}" ]; then
+    cp "$PRESSROOM_DAEMON" "$app/Contents/MacOS/pressroom"
+    mkdir -p "$app/Contents/Library/LaunchAgents"
+    cp Resources/works.luff.pressroom.daemon.plist "$app/Contents/Library/LaunchAgents/"
+fi
 "$here/scripts/sign.sh" "$app"
 echo "$app"

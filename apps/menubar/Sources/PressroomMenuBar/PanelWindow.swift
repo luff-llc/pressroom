@@ -8,11 +8,11 @@ import SwiftUI
 enum PanelWindow {
     private static var window: NSWindow?
 
-    static func open(model: StatusModel, loginItem: LoginItem) {
+    static func open(model: StatusModel, loginItem: LoginItem, daemonAgent: DaemonAgent) {
         Task { @MainActor in
             let window = NSWindow(
                 contentViewController: NSHostingController(
-                    rootView: StatusPanel(model: model, loginItem: loginItem)))
+                    rootView: StatusPanel(model: model, loginItem: loginItem, daemonAgent: daemonAgent)))
             window.title = "Pressroom"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false

@@ -8,6 +8,17 @@ This repository is the daemon and its contracts. The design is in the Galley rep
 (`docs/design/2026-11-15-device-capacity.md`). **Status: slice 1, the local half.** It
 runs on one machine and talks to nothing else yet.
 
+## Install
+
+On a Mac with Apple silicon, the menu bar app with the daemon inside it:
+
+```sh
+brew install --cask luff-llc/tap/pressroom
+```
+
+Open Pressroom once. It starts the daemon at login unless one is already running, and links
+the `pressroom` command. On Linux, build from source (below) and use `deploy/pressroom.service`.
+
 ## Use
 
 ```sh
@@ -69,3 +80,7 @@ Rust 1.99.1, no dependencies. `cargo test` runs the unit tests and the end-to-en
 which start a real daemon on a scratch folder in `/tmp`.
 
 Example service files are in `deploy/`. Nothing installs them.
+
+## Licence
+
+Apache-2.0. Copyright 2026 LUFF LLC.
