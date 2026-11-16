@@ -764,7 +764,7 @@ fn the_report_goes_out_through_the_sender_on_a_timer() {
         assert!(!report.contains(absent), "{absent} in {report}");
     }
     assert!(
-        !report.split(|c| c == ',' || c == ':').any(|part| {
+        !report.split([',', ':']).any(|part| {
             let p = part.trim_end_matches(['}', ']']);
             p.parse::<f64>().is_ok() && p.contains('.')
         }),
