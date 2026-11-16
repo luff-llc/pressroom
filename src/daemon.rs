@@ -14,6 +14,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 pub const PROTOCOL: &str = "pressroom.local/1";
+/// The report to Galley (contracts/report-v1.md).
+pub const REPORT: &str = "pressroom.report/1";
+const REPORT_EVERY: Duration = Duration::from_secs(20);
+const SENDER_LIMIT: Duration = Duration::from_secs(15);
+/// The most a report may weigh as JSON; Galley's sender refuses more.
+const REPORT_BYTES: usize = 256 * 1024;
 const TICK: Duration = Duration::from_secs(5);
 /// A job's leases die with its process; the expiry is only a last resort.
 const JOB_LEASE_SECS: u64 = 7 * 24 * 3600;
@@ -157,6 +163,12 @@ pub fn serve(home: PathBuf) -> Result<(), String> {
         }
         ticker.changed.notify_all();
     });
+
+    let galley = shared.lock().config.galley.clone();
+    if let Some(galley) = galley {
+        let reporter = shared.clone();
+        std::thread::spawn(move || report_loop(&reporter, &galley));
+    }
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -915,4 +927,269 @@ fn status(shared: &Arc<Shared>) -> Value {
         ("leases", Value::Arr(leases)),
         ("unreadableLeases", json::strs(&unreadable)),
     ])
+}
+
+/// Text cut to at most `max` bytes at a character boundary, never empty or blank, with
+/// control characters replaced, so Galley's checks never refuse a whole report for one label.
+fn clip(text: &str, max: usize) -> Value {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut end = clean.len().min(max);
+    while !clean.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = clean[..end].trim();
+    s(if cut.is_empty() { "-" } else { cut })
+}
+
+/// The report (contracts/report-v1.md): what `status` measures, in whole numbers, without
+/// process ids, lane folders or managed folders.
+fn report(shared: &Arc<Shared>, max_leases: usize) -> Value {
+    let state = shared.lock();
+    let at = now();
+    let budget = admit::budget(&state.config.limits, &state.measured);
+    let in_use = state.in_use();
+    let running = state
+        .running
+        .iter()
+        .take(64)
+        .map(|j| {
+            obj(vec![
+                ("job", clip(&j.id, 128)),
+                ("holder", clip(&j.holder, 256)),
+                ("label", clip(&j.label, 256)),
+                ("class", s(j.class.name())),
+                ("threads", n(j.threads)),
+                ("memoryBytes", n64(j.memory)),
+                ("forSecs", n64(at.saturating_sub(j.started))),
+            ])
+        })
+        .collect();
+    let mut order: Vec<&Waiter> = state.waiting.iter().collect();
+    order.sort_by_key(|w| (w.request.class, w.request.seq));
+    let waiting = order
+        .iter()
+        .take(64)
+        .map(|w| {
+            obj(vec![
+                ("holder", clip(&w.holder, 256)),
+                ("label", clip(&w.label, 256)),
+                ("class", s(w.request.class.name())),
+                ("threads", n(w.request.threads)),
+                ("reason", clip(&w.reason, 256)),
+                ("forSecs", n64(at.saturating_sub(w.since))),
+            ])
+        })
+        .collect();
+    let (leases, unreadable) = shared.store.all();
+    let leases = leases
+        .iter()
+        .filter(|l| l.live(at, &lease::pid_alive))
+        .take(max_leases)
+        .map(|l| {
+            obj(vec![
+                ("id", s(&l.id)),
+                ("holder", clip(&l.holder, 256)),
+                ("kind", s(&l.kind)),
+                ("mode", s(&l.mode)),
+                (
+                    "paths",
+                    Value::Arr(
+                        l.paths
+                            .iter()
+                            // A path cut short would name something else: leave it out.
+                            .filter(|p| p.len() <= 1024)
+                            .take(32)
+                            .map(s)
+                            .collect(),
+                    ),
+                ),
+                ("expires", n64(l.expires)),
+            ])
+        })
+        .collect();
+    obj(vec![
+        ("v", s(REPORT)),
+        ("measuredAt", n64(at)),
+        ("name", clip(&state.config.name, 128)),
+        (
+            "kind",
+            s(match state.config.limits.kind {
+                admit::Kind::Workstation => "workstation",
+                admit::Kind::Worker => "worker",
+            }),
+        ),
+        ("os", clip(&state.os, 512)),
+        ("arch", s(std::env::consts::ARCH)),
+        ("threads", n(state.measured.threads)),
+        ("memoryBytes", n64(state.measured.memory)),
+        ("offeredThreads", n(budget.threads.min(state.measured.threads))),
+        ("offeredMemoryBytes", n64(budget.memory)),
+        ("personPresent", Value::Bool(budget.person_present)),
+        ("usedThreads", n(in_use.threads)),
+        ("usedMemoryBytes", n64(in_use.memory)),
+        (
+            "loadHundredths",
+            n64((state.measured.load1.max(0.0) * 100.0).round() as u64),
+        ),
+        (
+            "outsideThreads",
+            n(admit::outside_load(&state.measured, in_use)),
+        ),
+        ("diskFreeBytes", n64(state.measured.disk_free)),
+        ("diskFloorBytes", n64(state.config.limits.disk_floor)),
+        (
+            "toolchains",
+            Value::Arr(
+                state
+                    .toolchains
+                    .iter()
+                    .take(16)
+                    .map(|(name, version)| {
+                        obj(vec![("name", s(name)), ("version", clip(version, 512))])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("running", Value::Arr(running)),
+        ("waiting", Value::Arr(waiting)),
+        ("leases", Value::Arr(leases)),
+        ("unreadableLeases", n64(unreadable.len() as u64)),
+    ])
+}
+
+/// The report as one line, within `REPORT_BYTES`: leases are left out from the end until it fits.
+fn report_line(shared: &Arc<Shared>) -> String {
+    let mut max = 256;
+    loop {
+        let line = json::write(&report(shared, max));
+        if line.len() <= REPORT_BYTES || max == 0 {
+            return line;
+        }
+        max /= 2;
+    }
+}
+
+/// Send one report at once and then one on each tick of a fixed timetable, for as long as the
+/// daemon runs. A send that overruns a tick waits for the next one; nothing drifts.
+fn report_loop(shared: &Arc<Shared>, galley: &machine::Galley) {
+    let every = report_every();
+    let mut failing = false;
+    let mut due = std::time::Instant::now();
+    loop {
+        let line = report_line(shared);
+        match send_report(galley, &line) {
+            Ok(()) if failing => {
+                failing = false;
+                shared.event(vec![("event", s("report_sent"))]);
+            }
+            Ok(()) => {}
+            Err((exit, why)) if !failing => {
+                failing = true;
+                shared.event(vec![
+                    ("event", s("report_failed")),
+                    ("exit", exit.map_or(Value::Null, n)),
+                    ("why", clip(&why, 200)),
+                ]);
+            }
+            Err(_) => {}
+        }
+        let now = std::time::Instant::now();
+        while due <= now {
+            due += every;
+        }
+        std::thread::sleep(due - now);
+    }
+}
+
+fn report_every() -> Duration {
+    // Debug builds only, for tests: a shorter interval.
+    #[cfg(debug_assertions)]
+    {
+        if let Some(secs) = std::env::var("PRESSROOM_TEST_REPORT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Duration::from_secs(secs.max(1));
+        }
+    }
+    REPORT_EVERY
+}
+
+fn sender_limit() -> Duration {
+    // Debug builds only, for tests: a shorter deadline.
+    #[cfg(debug_assertions)]
+    {
+        if let Some(secs) = std::env::var("PRESSROOM_TEST_SENDER_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Duration::from_secs(secs.max(1));
+        }
+    }
+    SENDER_LIMIT
+}
+
+/// Run the sender with the report on its standard input. `Err` carries its exit code (none if
+/// it could not start or was killed) and the first line it wrote to standard error.
+fn send_report(galley: &machine::Galley, line: &str) -> Result<(), (Option<i32>, String)> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(&galley.sender)
+        .arg("--origin")
+        .arg(&galley.origin)
+        .arg("--identity")
+        .arg(&galley.credential)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+        .env("HOME", std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| (None, format!("cannot start the sender: {e}")))?;
+    // Written beside the deadline, so a sender that never reads cannot hold the daemon past it;
+    // killing the sender closes the pipe and ends the write.
+    let writer = child.stdin.take().map(|mut stdin| {
+        let line = format!("{line}\n");
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(line.as_bytes());
+        })
+    });
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut first = String::new();
+        if let Some(stderr) = stderr {
+            let _ = BufReader::new(stderr).read_line(&mut first);
+        }
+        first.trim().to_string()
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() >= sender_limit() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break None,
+        }
+    };
+    let Some(status) = status else {
+        // A process the sender started may still hold its pipes: leave the two threads to end
+        // with it rather than wait on them.
+        return Err((None, "the sender did not finish in time".into()));
+    };
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    let why = reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else {
+        Err((status.code(), why))
+    }
 }

@@ -35,6 +35,15 @@ id=$(pressroom delete-begin /path/under/a/managed/folder) && rm -rf /path/... ; 
 of pressroom can read `~/.pressroom/leases/*.json` directly. The rules are in
 [contracts/local-v1.md](contracts/local-v1.md).
 
+## Seen in Galley
+
+With `galley`, `galley_credential` and `galley_sender` set in `machine.conf`, the daemon
+sends Galley a report every 20 seconds: what `status` measures, in whole numbers. It sends
+it by running Galley's `galley-machine-report` with the report on standard input. The
+sender signs with the machine's own key, the way any agent does. The daemon opens no port.
+Galley shows the machine on the board's Machines tab. The rules are in
+[contracts/report-v1.md](contracts/report-v1.md).
+
 ## What it would have changed on 14 November
 
 - Four builds on one laptop, load above 30: the second build waits, and says so.

@@ -15,14 +15,21 @@ struct Machine {
 impl Machine {
     /// A daemon on its own home in /tmp (a socket path must be short).
     fn start(name: &str, conf: &str) -> Machine {
+        Machine::start_with(name, |_| conf.to_string())
+    }
+    /// The configuration is made from the home, for settings that name files in it.
+    fn start_with(name: &str, conf: impl Fn(&Path) -> String) -> Machine {
         let home = PathBuf::from(format!("/tmp/pr-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
-        fs::write(home.join("machine.conf"), conf).unwrap();
+        fs::write(home.join("machine.conf"), conf(&home)).unwrap();
         let daemon = Command::new(BIN)
             .arg("daemon")
             .env("PRESSROOM_HOME", &home)
             .env("PRESSROOM_TEST_LOAD", "0")
+            .env("PRESSROOM_TEST_REPORT_SECS", "1")
+            .env("PRESSROOM_TEST_SENDER_SECS", "2")
+            .env("SECRET_IN_THE_DAEMONS_ENV", "must-not-reach-the-sender")
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
@@ -685,4 +692,171 @@ fn one_daemon_per_home() {
         m.cmd(&["status"]).status.success(),
         "the first daemon still answers"
     );
+}
+
+/// A stand-in for Galley's sender: it keeps its arguments, its environment and the report it was
+/// given, and exits as told by the file `exit` beside it (0 when absent).
+fn fake_sender(dir: &Path) -> PathBuf {
+    let script = dir.join("sender.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nd={d}\necho \"$@\" > $d/args\nenv > $d/env\ncat > $d/report.tmp && mv $d/report.tmp $d/report\n\
+             n=$(cat $d/count 2>/dev/null || echo 0); echo $((n+1)) > $d/count\n\
+             if [ -f $d/slow ]; then sleep $(cat $d/slow); fi\n\
+             if [ -f $d/exit ]; then echo authorization_denied >&2; exit $(cat $d/exit); fi\n",
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    script
+}
+
+fn galley_conf(home: &Path) -> String {
+    let out = home.join("out");
+    fs::create_dir_all(&out).unwrap();
+    format!(
+        "{WORKER}galley = https://galley.example.test\ngalley_credential = {}\ngalley_sender = {}\n",
+        home.join("identity.json").display(),
+        fake_sender(&out).display()
+    )
+}
+
+fn wait_file(path: &Path, test: impl Fn(&str) -> bool) -> String {
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        let found = fs::read_to_string(path).unwrap_or_default();
+        if test(&found) {
+            return found;
+        }
+        assert!(Instant::now() < until, "never saw what was wanted in {}:\n{found}", path.display());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn the_report_goes_out_through_the_sender_on_a_timer() {
+    let m = Machine::start_with("report", galley_conf);
+    let out = m.home.join("out");
+    // A job is running and a lease is held while a report is made.
+    let mut job = m
+        .command(&["run", "--threads", "1", "--lane", "demo", "--label", "cargo test", "--", "sleep", "5"])
+        .spawn()
+        .unwrap();
+    let report = wait_file(&out.join("report"), |r| r.contains("cargo test"));
+    let _ = job.wait();
+
+    assert!(report.starts_with("{\"v\":\"pressroom.report/1\""), "{report}");
+    for field in [
+        "\"measuredAt\":", "\"name\":", "\"kind\":\"worker\"", "\"os\":", "\"arch\":",
+        "\"threads\":", "\"memoryBytes\":", "\"offeredThreads\":", "\"offeredMemoryBytes\":",
+        "\"usedThreads\":1", "\"usedMemoryBytes\":", "\"personPresent\":false",
+        "\"loadHundredths\":0", "\"outsideThreads\":0", "\"diskFreeBytes\":", "\"diskFloorBytes\":0",
+        "\"toolchains\":[", "\"holder\":\"agent:test\"", "\"class\":\"batch\"", "\"forSecs\":",
+        "\"waiting\":[]", "\"kind\":\"cache\"", "\"mode\":\"in-use\"", "\"unreadableLeases\":0",
+    ] {
+        assert!(report.contains(field), "{field} missing from {report}");
+    }
+    // Whole numbers only, and nothing the contract leaves out.
+    for absent in ["\"pid\"", "\"lane\"", "\"managed\"", "\"lanePath\"", "\"load1\"", "Gb\""] {
+        assert!(!report.contains(absent), "{absent} in {report}");
+    }
+    assert!(
+        !report.split([',', ':']).any(|part| {
+            let p = part.trim_end_matches(['}', ']']);
+            p.parse::<f64>().is_ok() && p.contains('.')
+        }),
+        "a fractional number in {report}"
+    );
+
+    // The sender is told where and as whom, by paths only, with nothing else in its environment.
+    let args = fs::read_to_string(out.join("args")).unwrap();
+    assert_eq!(
+        args.trim(),
+        format!("--origin https://galley.example.test --identity {}", m.home.join("identity.json").display())
+    );
+    let env = fs::read_to_string(out.join("env")).unwrap();
+    assert!(!env.contains("must-not-reach-the-sender"), "{env}");
+    assert!(!env.contains("PRESSROOM_HOME"), "{env}");
+    for line in env.lines() {
+        let key = line.split('=').next().unwrap();
+        assert!(["PATH", "HOME", "PWD", "SHLVL", "_", "OLDPWD"].contains(&key), "{line}");
+    }
+
+    // On a timer: more reports follow without anything asking.
+    let count = |m: &Machine| -> u32 {
+        fs::read_to_string(m.home.join("out/count")).unwrap_or_default().trim().parse().unwrap_or(0)
+    };
+    let seen = count(&m);
+    wait_file(&out.join("count"), |c| c.trim().parse::<u32>().unwrap_or(0) >= seen + 2);
+}
+
+#[test]
+fn a_refused_report_is_written_once_and_the_machine_carries_on() {
+    let m = Machine::start_with("refused", galley_conf);
+    let out = m.home.join("out");
+    wait_file(&out.join("count"), |c| !c.trim().is_empty());
+    fs::write(out.join("exit"), "1").unwrap();
+    let start = fs::read_to_string(out.join("count")).unwrap().trim().parse::<u32>().unwrap();
+    wait_file(&out.join("count"), |c| c.trim().parse::<u32>().unwrap_or(0) >= start + 3);
+    let events = fs::read_to_string(m.home.join("events.log")).unwrap();
+    let failed: Vec<&str> = events.lines().filter(|l| l.contains("report_failed")).collect();
+    assert_eq!(failed.len(), 1, "{events}");
+    assert!(failed[0].contains("\"exit\":1") && failed[0].contains("authorization_denied"), "{events}");
+    // Work is still admitted while reports fail.
+    assert!(m.cmd(&["run", "--", "true"]).status.success());
+    // Back to accepted: one line says so.
+    fs::remove_file(out.join("exit")).unwrap();
+    wait_file(&m.home.join("events.log"), |e| e.contains("report_sent"));
+}
+
+#[test]
+fn without_galley_settings_nothing_is_sent_and_half_set_ones_stop_the_daemon() {
+    // None of the three: the daemon works and runs no sender.
+    let m = Machine::start("quiet", WORKER);
+    assert!(m.cmd(&["run", "--", "true"]).status.success());
+    std::thread::sleep(Duration::from_millis(1500));
+    let events = fs::read_to_string(m.home.join("events.log")).unwrap_or_default();
+    assert!(!events.contains("report_"), "{events}");
+
+    // One or two of the three: the daemon refuses to start.
+    let home = PathBuf::from(format!("/tmp/pr-{}-half", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("machine.conf"), "galley = https://galley.example.test\n").unwrap();
+    let out = Command::new(BIN)
+        .arg("daemon")
+        .env("PRESSROOM_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("set all three or none"), "{}", text(&out.stderr));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_slow_or_stuck_sender_neither_holds_the_daemon_nor_moves_the_timetable() {
+    let m = Machine::start_with("slow", galley_conf);
+    let out = m.home.join("out");
+    let count = || -> u32 {
+        fs::read_to_string(out.join("count")).unwrap_or_default().trim().parse().unwrap_or(0)
+    };
+    wait_file(&out.join("count"), |c| !c.trim().is_empty());
+    // A send that takes 0.6 s of each 1 s tick: still one report a tick, not one every 1.6 s.
+    fs::write(out.join("slow"), "0.6").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = count();
+    std::thread::sleep(Duration::from_millis(6200));
+    let sent = count() - before;
+    assert!(sent >= 6, "only {sent} reports in 6.2 s");
+
+    // A sender that never finishes is killed at its deadline and recorded once; work goes on.
+    fs::write(out.join("slow"), "30").unwrap();
+    let events = wait_file(&m.home.join("events.log"), |e| e.contains("did not finish in time"));
+    assert_eq!(events.matches("report_failed").count(), 1, "{events}");
+    assert!(m.cmd(&["run", "--", "true"]).status.success());
+    fs::remove_file(out.join("slow")).unwrap();
+    wait_file(&m.home.join("events.log"), |e| e.contains("report_sent"));
 }
