@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The daemon bundled in Pressroom.app, registered by the app with SMAppService. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>works.luff.pressroom.daemon</string>
+  <key>BundleProgram</key><string>Contents/MacOS/pressroom</string>
+  <key>ProgramArguments</key>
+  <array><string>pressroom</string><string>daemon</string><string>--if-not-running</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>AssociatedBundleIdentifiers</key>
+  <array><string>works.luff.pressroom.menubar</string></array>
+</dict>
+</plist>

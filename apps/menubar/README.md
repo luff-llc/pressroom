@@ -21,6 +21,15 @@ starts, admits, leases or cleans anything, and with no daemon it says so and doe
 
 ![Held](docs/panel-held.png) ![Given](docs/panel-given.png)
 
+## The daemon inside
+
+The release build (`scripts/release.sh`) carries the `pressroom` command in
+`Contents/MacOS/pressroom` and a LaunchAgent for it, which the app registers with
+`SMAppService`. **Run the daemon at login** is a setting with a default: on, applied once,
+the first time an installed app finds no daemon answering. A Mac whose daemon was started
+another way (a hand-made LaunchAgent, a systemd unit) keeps that one; the app refuses to start
+a second. The Homebrew cask links the command onto the PATH.
+
 ## Start at login
 
 On by default, applied once, the first time the app runs from `/Applications` or
@@ -35,6 +44,10 @@ Swift 6 language mode, macOS 15 or later, no dependencies. Start builds through 
 pressroom run --threads 4 --memory-gb 4 --lane pressroom-menubar -- swift test
 pressroom run --threads 4 --memory-gb 4 --lane pressroom-menubar -- scripts/bundle.sh
 ```
+
+A notarized release: `scripts/release.sh VERSION` (Apple silicon, LUFF LLC's Developer ID
+and an App Store Connect key for `asc`) builds the daemon and the app, signs both, notarizes,
+staples and writes `dist/<VERSION>/Pressroom-<VERSION>-macOS-arm64.zip`.
 
 `scripts/bundle.sh` writes `build/Pressroom.app` and signs it with `scripts/sign.sh`: as
 LUFF LLC's Developer ID (hardened runtime) where the keychain has it, otherwise ad hoc. Build

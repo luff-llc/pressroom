@@ -3,6 +3,8 @@ name = "pressroom"
 version = "0.1.0"
 edition = "2021"
 description = "The machines agents run work on: one gatekeeper per machine."
+license = "Apache-2.0"
+repository = "https://github.com/luff-llc/pressroom"
 publish = false
 
 # No dependencies. Anything added goes on the allowlist in docs/references.md first,

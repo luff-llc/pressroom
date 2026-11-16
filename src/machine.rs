@@ -344,7 +344,78 @@ pub fn remeasure(home: &Path, m: &mut Measured) {
 }
 
 /// Toolchains found on this machine, as `(name, version line)`. Measured, never typed.
+/// Where to look for a toolchain: the daemon's PATH, then the folders people usually install
+/// into. A daemon started at login by launchd gets only the system PATH, and version managers
+/// (rustup, mise, nvm, bun) put their programs under the person's home.
+pub fn tool_dirs(path: Option<&str>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut more: Vec<PathBuf> = path
+        .unwrap_or("")
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    more.push(PathBuf::from("/opt/homebrew/bin"));
+    more.push(PathBuf::from("/usr/local/bin"));
+    if let Some(home) = home {
+        for sub in [".local/bin", ".cargo/bin", ".local/share/mise/shims", ".bun/bin"] {
+            more.push(home.join(sub));
+        }
+        // Newest first: toolchain and node version folders sort by name.
+        for (parent, child) in [(".rustup/toolchains", "bin"), (".nvm/versions/node", "bin")] {
+            let mut found: Vec<PathBuf> = fs::read_dir(home.join(parent))
+                .map(|entries| entries.flatten().map(|e| e.path().join(child)).collect())
+                .unwrap_or_default();
+            found.sort_by_key(|p| std::cmp::Reverse(version_key(p)));
+            more.extend(found);
+        }
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in more {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Sort key for a version folder name: runs of digits compare as numbers, so `1.100` is
+/// newer than `1.99` and `v22` than `v9`.
+fn version_key(path: &Path) -> Vec<(u64, String)> {
+    let name = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut key = Vec::new();
+    let mut digits = String::new();
+    let mut other = String::new();
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            if !other.is_empty() {
+                key.push((0, std::mem::take(&mut other)));
+            }
+            digits.push(c);
+        } else {
+            if !digits.is_empty() {
+                key.push((digits.parse().unwrap_or(u64::MAX), String::new()));
+                digits.clear();
+            }
+            other.push(c);
+        }
+    }
+    if !digits.is_empty() {
+        key.push((digits.parse().unwrap_or(u64::MAX), String::new()));
+    }
+    if !other.is_empty() {
+        key.push((0, other));
+    }
+    key
+}
+
 pub fn toolchains() -> Vec<(String, String)> {
+    let path = std::env::var("PATH").ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dirs = tool_dirs(path.as_deref(), home.as_deref());
     let mut found = Vec::new();
     let probes: [(&str, &str, &[&str]); 5] = [
         ("rustc", "rustc", &["--version"]),
@@ -354,7 +425,13 @@ pub fn toolchains() -> Vec<(String, String)> {
         ("xcode", "xcodebuild", &["-version"]),
     ];
     for (name, program, args) in probes {
-        if let Some(text) = output(program, args) {
+        // The first copy that answers: a broken link or a stale shim is passed over.
+        let text = dirs
+            .iter()
+            .map(|dir| dir.join(program))
+            .filter(|candidate| candidate.is_file())
+            .find_map(|candidate| output(&candidate.to_string_lossy(), args));
+        if let Some(text) = text {
             let line = text.lines().collect::<Vec<_>>().join(", ");
             if !line.is_empty() {
                 found.push((name.to_string(), line));
@@ -371,6 +448,34 @@ pub fn os() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_are_looked_for_beyond_the_path() {
+        let home = std::env::temp_dir().join(format!("pr-tools-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        for dir in [
+            ".rustup/toolchains/1.98.0-x/bin",
+            ".rustup/toolchains/1.99.1-x/bin",
+            ".nvm/versions/node/v9.0.0/bin",
+            ".nvm/versions/node/v22.1.0/bin",
+        ] {
+            fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        let dirs = tool_dirs(Some("/usr/bin:/bin:/usr/bin"), Some(&home));
+        assert_eq!(dirs[0], PathBuf::from("/usr/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/bin"));
+        let usr_bin = Path::new("/usr/bin");
+        assert_eq!(dirs.iter().filter(|d| d.as_path() == usr_bin).count(), 1);
+        let cargo = dirs.iter().position(|d| d.ends_with(".cargo/bin")).unwrap();
+        let newest = dirs.iter().position(|d| d.ends_with("1.99.1-x/bin")).unwrap();
+        let older = dirs.iter().position(|d| d.ends_with("1.98.0-x/bin")).unwrap();
+        assert!(cargo < newest && newest < older, "{dirs:?}");
+        let v22 = dirs.iter().position(|d| d.ends_with("v22.1.0/bin")).unwrap();
+        let v9 = dirs.iter().position(|d| d.ends_with("v9.0.0/bin")).unwrap();
+        assert!(v22 < v9, "numbers compare as numbers: {dirs:?}");
+        assert!(dirs.contains(&home.join(".local/share/mise/shims")));
+        let _ = fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn parsers() {

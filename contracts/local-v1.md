@@ -16,7 +16,7 @@ Everything is under `$PRESSROOM_HOME`, else `~/.pressroom`, readable by its user
 |---|---|
 | `machine.conf` | What the owner declared. `key = value` lines. An unknown key or a bad value stops the daemon; it never falls back to a looser limit. |
 | `sock` | The daemon's socket, mode 600 |
-| `daemon.pid` | The running daemon's process. One daemon per home; a second refuses to start. |
+| `daemon.pid` | The running daemon's process. One daemon per home; a second refuses to start and exits 1, or 0 with `--if-not-running` (for login agents, which must not retry). |
 | `leases/<id>.json` | One file per live lease |
 | `lanes/<repo>/<toolchain>/<n>/` | Cache lanes |
 | `checkouts/`, `scratch/`, `results/` | Other managed folders |
@@ -168,7 +168,7 @@ One object. Numbers in GB may have fractions; seconds are whole.
 | `usedThreads`, `usedMemoryGb` | What admitted work holds |
 | `load1`, `outsideLoad` | Load average, and the whole threads of it pressroom did not admit |
 | `diskFreeGb`, `diskFloorGb` | Free disk and the floor below which nothing new starts |
-| `toolchains` | `[{"name","version"}]` |
+| `toolchains` | `[{"name","version"}]`, for `rustc`, `cargo`, `bun`, `node` and `xcode`: the first copy that answers, on the daemon's PATH, then in `/opt/homebrew/bin`, `/usr/local/bin`, and under the home folder `.local/bin`, `.cargo/bin`, `.local/share/mise/shims`, `.bun/bin`, and the newest `.rustup/toolchains/*/bin` and `.nvm/versions/node/*/bin` |
 | `managed` | The managed folders |
 | `running` | `[{"job","holder","label","class","threads","memoryGb","lane","pid","forSecs"}]`; `lane` and `pid` may be null |
 | `waiting` | `[{"holder","label","class","threads","reason","forSecs"}]`, in the order they will be admitted |

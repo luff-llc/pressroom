@@ -1,3 +1,6 @@
 target/
 *.sock
 .DS_Store
+
+# Release builds
+/dist/

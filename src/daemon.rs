@@ -120,7 +120,19 @@ impl Shared {
     }
 }
 
-pub fn serve(home: PathBuf) -> Result<(), String> {
+/// Why the daemon did not run: another daemon already owns this home, or something else.
+pub enum ServeError {
+    AlreadyRunning(String),
+    Failed(String),
+}
+
+impl From<String> for ServeError {
+    fn from(why: String) -> Self {
+        ServeError::Failed(why)
+    }
+}
+
+pub fn serve(home: PathBuf) -> Result<(), ServeError> {
     let layout = Layout { home };
     fs::create_dir_all(&layout.home)
         .map_err(|e| format!("cannot create {:?}: {e}", layout.home))?;
@@ -131,10 +143,10 @@ pub fn serve(home: PathBuf) -> Result<(), String> {
         fs::create_dir_all(&dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
     }
     let socket = layout.socket();
-    claim(&layout)?;
+    claim(&layout).map_err(ServeError::AlreadyRunning)?;
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)
-        .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
+        .map_err(|e| ServeError::Failed(format!("cannot listen on {}: {e}", socket.display())))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("cannot protect the socket: {e}"))?;
 

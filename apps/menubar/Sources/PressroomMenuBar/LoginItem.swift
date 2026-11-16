@@ -22,7 +22,10 @@ final class LoginItem {
     }
 
     /// Only an installed app can be a login item.
-    var isInstalled: Bool {
+    var isInstalled: Bool { Self.isInstalledApp }
+
+    /// An app bundle in `/Applications` or `~/Applications`, where Homebrew and people put it.
+    nonisolated static var isInstalledApp: Bool {
         let folder = Bundle.main.bundleURL.deletingLastPathComponent().path
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return Bundle.main.bundleURL.pathExtension == "app"

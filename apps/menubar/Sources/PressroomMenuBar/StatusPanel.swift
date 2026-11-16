@@ -6,6 +6,7 @@ import SwiftUI
 struct StatusPanel: View {
     let model: StatusModel
     let loginItem: LoginItem
+    let daemonAgent: DaemonAgent
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -14,7 +15,7 @@ struct StatusPanel: View {
                 ProgressView("Asking the daemon…")
                     .controlSize(.small)
             case .notRunning:
-                NotRunningView()
+                NotRunningView(canRunIt: daemonAgent.isAvailable)
             case .failed(let why):
                 Label(why, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
@@ -22,7 +23,7 @@ struct StatusPanel: View {
                 LiveStatusView(status: status, model: model)
             }
             Divider()
-            FooterView(updated: model.updated, loginItem: loginItem)
+            FooterView(updated: model.updated, loginItem: loginItem, daemonAgent: daemonAgent)
         }
         .padding(14)
         .frame(width: 360)
@@ -31,13 +32,24 @@ struct StatusPanel: View {
 
 /// No daemon: say so, and how to start one. The item never starts or stands in for it.
 struct NotRunningView: View {
+    let canRunIt: Bool
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Label("The Pressroom daemon is not running", systemImage: "square.stack.3d.up.slash")
                 .font(.headline)
-            Text("Nothing new starts through pressroom until it is back; work it already started carries on. Start it with:")
+            Text("Nothing new starts through pressroom until it is back; work it already started carries on.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if canRunIt {
+                Text("Turn on \u{201C}Run the daemon at login\u{201D} below, or start it with:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Start it with:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             Text("pressroom daemon")
                 .font(.callout.monospaced())
                 .textSelection(.enabled)
@@ -103,9 +115,28 @@ struct HeaderView: View {
 struct FooterView: View {
     let updated: Date?
     let loginItem: LoginItem
+    let daemonAgent: DaemonAgent
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if daemonAgent.isAvailable {
+                Toggle(
+                    "Run the daemon at login",
+                    isOn: Binding(
+                        get: { daemonAgent.isOn },
+                        set: { on in Task { await daemonAgent.set(on) } })
+                )
+                .toggleStyle(.checkbox)
+                .accessibilityIdentifier("pressroom.runDaemon")
+                if daemonAgent.needsApproval {
+                    Button("Allow the daemon in Login Items…") { daemonAgent.openSettings() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+                if let error = daemonAgent.error {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+            }
             if loginItem.isInstalled {
                 Toggle(
                     "Start at login",
