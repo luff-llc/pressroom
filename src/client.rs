@@ -306,6 +306,9 @@ pub fn status(layout: &Layout, as_json: bool) -> i32 {
             "           about {} threads of load were not started through pressroom",
             num("outsideLoad")
         );
+        for line in busiest() {
+            println!("             {line}");
+        }
     }
     println!(
         "  memory   {:.1} of {:.1} GB offered in use ({:.0} GB on the machine)",
@@ -548,4 +551,29 @@ pub fn measure(layout: &Layout) -> i32 {
     ]);
     println!("{}", json::write(&value));
     0
+}
+
+/// The programs using the most processor right now, as `ps` reports them: at most four,
+/// each using a tenth of a thread or more. Shown beside outside load so a person can see
+/// whether it is the desktop or a stray build. Empty if `ps` cannot be run.
+fn busiest() -> Vec<String> {
+    let sort: &[&str] = if cfg!(target_os = "macos") {
+        &["-Ao", "pcpu=,comm=", "-r"]
+    } else {
+        &["-eo", "pcpu=,comm=", "--sort=-pcpu"]
+    };
+    let Ok(out) = std::process::Command::new("ps").args(sort).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (percent, program) = line.trim().split_once(char::is_whitespace)?;
+            let percent: f64 = percent.parse().ok()?;
+            let name = program.trim().rsplit('/').next().unwrap_or("").trim();
+            (percent >= 10.0 && !name.is_empty() && name != "ps")
+                .then(|| format!("{:.1} threads  {name}", percent / 100.0))
+        })
+        .take(4)
+        .collect()
 }

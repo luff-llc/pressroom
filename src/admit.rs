@@ -183,6 +183,14 @@ pub fn outside_load(m: &Measured, in_use: InUse) -> u32 {
     load.saturating_sub(in_use.threads)
 }
 
+/// Threads free for new work: what is left of the offer, and never more than what is left
+/// of the machine once admitted work and outside load are counted.
+pub fn free_threads(machine: u32, offered: u32, in_use: u32, outside: u32) -> u32 {
+    let of_offer = offered.saturating_sub(in_use);
+    let of_machine = machine.saturating_sub(in_use.saturating_add(outside));
+    of_offer.min(of_machine)
+}
+
 /// Decide for one request. `ahead` is how many waiting requests come before it in order
 /// (class first, then arrival); only the head of the line may be admitted, so a large
 /// job is never starved by small ones slipping past.
@@ -227,9 +235,14 @@ pub fn decide(
     // request is given what is free when that is at least half of what it asked, so a
     // little load from elsewhere does not hold a large job back for ever. What is
     // granted never takes the machine past its budget.
+    //
+    // Load pressroom did not admit is taken first from the threads the machine keeps back
+    // (the person's share on a workstation), and only what is left over comes off the
+    // offer. A desktop's ordinary load therefore never holds the queue; a build started
+    // outside pressroom that fills the machine still does.
     let want = request.threads.clamp(1, b.threads);
     let outside = outside_load(m, in_use);
-    let free = b.threads.saturating_sub(in_use.threads + outside);
+    let free = free_threads(m.threads, b.threads, in_use.threads, outside);
     if free < want.div_ceil(2) {
         let who = if b.person_present {
             " while its person is using it"
@@ -368,8 +381,8 @@ mod tests {
         }
         assert_eq!(started, 1);
         assert_eq!(
-            in_use.threads, 7,
-            "the offered half, less the load already there"
+            in_use.threads, 8,
+            "the offered half; a little load elsewhere comes off the kept half"
         );
     }
 
@@ -454,6 +467,29 @@ mod tests {
             Decision::Wait { reason } => assert!(reason.contains("not started through pressroom")),
             other => panic!("{other:?}"),
         }
+        // A desktop's own load (window server, browser) is taken from the half kept for
+        // the person, so it does not hold the queue.
+        assert_eq!(
+            decide(
+                &l,
+                &macbook(Some(10), 9.4),
+                Said::Nothing,
+                InUse {
+                    threads: 2,
+                    memory: GB
+                },
+                &req(0, Class::Waiting, 2, 1),
+                0
+            ),
+            Decision::Admit { threads: 2 }
+        );
+        // Once outside load passes the kept half, it comes off the offer.
+        assert_eq!(free_threads(16, 8, 0, 8), 8);
+        assert_eq!(free_threads(16, 8, 0, 11), 5);
+        assert_eq!(free_threads(16, 8, 2, 11), 3);
+        assert_eq!(free_threads(16, 8, 0, 16), 0);
+        // With every thread offered there is no kept share to absorb it.
+        assert_eq!(free_threads(16, 16, 0, 5), 11);
         // Our own admitted work is not counted twice.
         let used = InUse {
             threads: 4,
