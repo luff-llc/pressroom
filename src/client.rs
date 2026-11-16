@@ -284,6 +284,16 @@ pub fn status(layout: &Layout, as_json: bool) -> i32 {
         reply.str("os").unwrap_or("?"),
         reply.str("arch").unwrap_or("?"),
     );
+    if let Some(says) = reply.get("personSays").filter(|v| **v != Value::Null) {
+        let left = lease::span(says.u64("until").unwrap_or(0).saturating_sub(now()));
+        match says.str("mode") {
+            Some("hold") => {
+                println!("  its person has asked for the whole machine, for {left} more")
+            }
+            Some("give") => println!("  its person has given the whole machine, for {left} more"),
+            _ => {}
+        }
+    }
     println!(
         "  threads  {} of {} offered in use ({} on the machine); load {:.1}",
         num("usedThreads"),
@@ -426,6 +436,25 @@ pub fn lease_add(
     }
     finish(ask(layout, &obj(request)), |reply| {
         println!("{}", reply.str("id").unwrap_or(""))
+    })
+}
+
+/// Say "I need the whole machine" (`hold`), "take it all" (`give`) or go back to what is
+/// measured (`auto`).
+pub fn person_says(layout: &Layout, holder: &str, mode: &str, minutes: f64) -> i32 {
+    let mut request = vec![
+        ("op", s("person-says")),
+        ("holder", s(holder)),
+        ("mode", s(mode)),
+    ];
+    if mode != "auto" {
+        request.push(("forSecs", n64((minutes * 60.0).round() as u64)));
+    }
+    finish(ask(layout, &obj(request)), |reply| {
+        match reply.u64("until") {
+            Some(until) => println!("{mode} for {}", lease::span(until.saturating_sub(now()))),
+            None => println!("auto: back to what is measured"),
+        }
     })
 }
 

@@ -44,6 +44,12 @@ sender signs with the machine's own key, the way any agent does. The daemon open
 Galley shows the machine on the board's Machines tab. The rules are in
 [contracts/report-v1.md](contracts/report-v1.md).
 
+## In the menu bar
+
+`apps/menubar` is a macOS menu bar item that shows what `status` shows and lets the person
+hold the machine or give it all for a while (`pressroom person hold|give|auto`). It is a
+client of the socket only. See [apps/menubar/README.md](apps/menubar/README.md).
+
 ## What it would have changed on 14 November
 
 - Four builds on one laptop, load above 30: the second build waits, and says so.

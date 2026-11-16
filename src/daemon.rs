@@ -1,7 +1,7 @@
 //! The daemon: one per machine. It is the only thing that admits heavy work, assigns
 //! cache lanes, and writes leases. It listens on a socket only its own user can open.
 
-use crate::admit::{self, ahead_of, Class, Decision, InUse, Measured, Request, GB};
+use crate::admit::{self, ahead_of, Class, Decision, InUse, Measured, Request, Said, GB};
 use crate::json::{self, n, n64, obj, s, Value};
 use crate::lease::{self, DeleteRules, Lease, Store, Verdict};
 use crate::machine::{self, now, Config, Layout};
@@ -27,6 +27,8 @@ const MAX_LINE: usize = 64 * 1024;
 const FIRST_LINE: Duration = Duration::from_secs(10);
 const WRITE: Duration = Duration::from_secs(2);
 const MAX_PATHS: usize = 32;
+/// The longest a person's word stands: a week.
+const MAX_SAID_SECS: u64 = 7 * 24 * 3600;
 
 struct Job {
     id: String,
@@ -57,9 +59,31 @@ struct State {
     running: Vec<Job>,
     waiting: Vec<Waiter>,
     seq: u64,
+    /// What the person last said (rules 19 to 21). Not kept across a restart.
+    person: Option<PersonSays>,
+}
+
+#[derive(Clone)]
+struct PersonSays {
+    said: Said,
+    since: u64,
+    until: u64,
+    holder: String,
 }
 
 impl State {
+    /// What the person said, if it still stands at `at`.
+    fn said(&self, at: u64) -> Said {
+        match &self.person {
+            Some(p)
+                if admit::still_stands(p.said, p.since, p.until, at, self.measured.idle_secs) =>
+            {
+                p.said
+            }
+            _ => Said::Nothing,
+        }
+    }
+
     fn in_use(&self) -> InUse {
         InUse {
             threads: self.running.iter().map(|j| j.threads).sum(),
@@ -116,7 +140,7 @@ pub fn serve(home: PathBuf) -> Result<(), String> {
 
     let store = Store::new(layout.leases());
     store.sweep(now());
-    let budget = admit::budget(&config.limits, &measured);
+    let budget = admit::budget(&config.limits, &measured, Said::Nothing);
     eprintln!(
         "pressroom: {} offers {} of {} threads and {} of memory; listening on {}",
         config.name,
@@ -134,6 +158,7 @@ pub fn serve(home: PathBuf) -> Result<(), String> {
             running: Vec::new(),
             waiting: Vec::new(),
             seq: 0,
+            person: None,
         }),
         changed: Condvar::new(),
         layout,
@@ -152,6 +177,16 @@ pub fn serve(home: PathBuf) -> Result<(), String> {
             let mut state = ticker.lock();
             state.measured = fresh;
             let at = now();
+            if state.person.is_some() && state.said(at) == Said::Nothing {
+                let ended = state.person.take();
+                if let Some(p) = ended {
+                    ticker.event(vec![
+                        ("event", s("person_says_ended")),
+                        ("mode", s(p.said.name())),
+                        ("holder", s(&p.holder)),
+                    ]);
+                }
+            }
             for id in state.running.iter().flat_map(|j| &j.lease_ids) {
                 if let Some(mut lease) = ticker.store.get(id) {
                     if lease.expires.saturating_sub(at) < JOB_LEASE_SECS / 2 {
@@ -292,6 +327,10 @@ fn handle(shared: &Arc<Shared>, stream: UnixStream) -> Result<(), String> {
             let reply = release(shared, &request);
             reply_to(&mut stream, reply)
         }
+        Some("person-says") => {
+            let reply = person_says(shared, &request);
+            reply_to(&mut stream, reply)
+        }
         _ => refuse(&mut stream, "unknown op"),
     }
 }
@@ -304,7 +343,12 @@ fn reply_to(stream: &mut UnixStream, reply: Result<Value, String>) -> Result<(),
 }
 
 fn text(request: &Value, key: &str, default: &str, max: usize) -> Result<String, String> {
-    let value = request.str(key).unwrap_or(default);
+    // A field of the wrong type is refused, never replaced by the default.
+    let value = match request.get(key) {
+        None | Some(Value::Null) => default,
+        Some(Value::Str(value)) => value.as_str(),
+        _ => return Err(format!("{key} must be text")),
+    };
     if value.is_empty() || value.len() > max || value.chars().any(|c| c.is_control()) {
         return Err(format!("{key} must be 1 to {max} printable characters"));
     }
@@ -470,6 +514,7 @@ fn run(
         let mut decision = admit::decide(
             &state.config.limits,
             &state.measured,
+            state.said(now()),
             state.in_use(),
             &me,
             ahead,
@@ -824,10 +869,86 @@ fn delete_begin(shared: &Arc<Shared>, request: &Value) -> Result<Value, String> 
     ]))
 }
 
+/// The person says "I need the whole machine" (`hold`), "take it all, I am away" (`give`),
+/// or "go back to what you measure" (`auto`). Rules 19 to 21.
+fn person_says(shared: &Arc<Shared>, request: &Value) -> Result<Value, String> {
+    let holder = text(request, "holder", "unknown", 128)?;
+    let said = match request.get("mode") {
+        Some(Value::Str(mode)) => Said::parse(mode),
+        _ => None,
+    }
+    .ok_or("mode is hold, give or auto")?;
+    let secs = match (said, request.get("forSecs")) {
+        (Said::Nothing, None | Some(Value::Null)) => 0,
+        (Said::Nothing, _) => return Err("auto takes no forSecs".into()),
+        (_, Some(Value::Num(secs)))
+            if secs.fract() == 0.0 && *secs >= 60.0 && *secs <= MAX_SAID_SECS as f64 =>
+        {
+            *secs as u64
+        }
+        _ => {
+            return Err(format!(
+                "forSecs must be a whole number from 60 to {MAX_SAID_SECS}"
+            ))
+        }
+    };
+    let at = now();
+    let until = at + secs;
+    let lapsed = {
+        let mut state = shared.lock();
+        // What was said before may have ended since the last tick: record that first.
+        let lapsed = match &state.person {
+            Some(p) if state.said(at) == Said::Nothing => Some(p.clone()),
+            _ => None,
+        };
+        state.person = (said != Said::Nothing).then(|| PersonSays {
+            said,
+            since: at,
+            until,
+            holder: holder.clone(),
+        });
+        lapsed
+    };
+    shared.changed.notify_all();
+    if let Some(p) = lapsed {
+        shared.event(vec![
+            ("event", s("person_says_ended")),
+            ("mode", s(p.said.name())),
+            ("holder", s(&p.holder)),
+        ]);
+    }
+    shared.event(vec![
+        ("event", s("person_says")),
+        ("mode", s(said.name())),
+        ("holder", s(&holder)),
+        (
+            "until",
+            if said == Said::Nothing {
+                Value::Null
+            } else {
+                n64(until)
+            },
+        ),
+    ]);
+    Ok(obj(vec![
+        ("ok", Value::Bool(true)),
+        ("mode", s(said.name())),
+        (
+            "until",
+            if said == Said::Nothing {
+                Value::Null
+            } else {
+                n64(until)
+            },
+        ),
+    ]))
+}
+
 fn status(shared: &Arc<Shared>) -> Value {
     let state = shared.lock();
     let at = now();
-    let budget = admit::budget(&state.config.limits, &state.measured);
+    let said = state.said(at);
+    let budget = admit::budget(&state.config.limits, &state.measured, said);
     let in_use = state.in_use();
     let running = state
         .running
@@ -889,6 +1010,18 @@ fn status(shared: &Arc<Shared>) -> Value {
         ("offeredThreads", n(budget.threads)),
         ("offeredMemoryGb", n(budget.memory as f64 / GB as f64)),
         ("personPresent", Value::Bool(budget.person_present)),
+        (
+            "personSays",
+            match &state.person {
+                Some(p) if said != Said::Nothing => obj(vec![
+                    ("mode", s(p.said.name())),
+                    ("holder", s(&p.holder)),
+                    ("since", n64(p.since)),
+                    ("until", n64(p.until)),
+                ]),
+                _ => Value::Null,
+            },
+        ),
         ("usedThreads", n(in_use.threads)),
         ("usedMemoryGb", n(in_use.memory as f64 / GB as f64)),
         ("load1", n(state.measured.load1)),
@@ -949,7 +1082,7 @@ fn clip(text: &str, max: usize) -> Value {
 fn report(shared: &Arc<Shared>, max_leases: usize) -> Value {
     let state = shared.lock();
     let at = now();
-    let budget = admit::budget(&state.config.limits, &state.measured);
+    let budget = admit::budget(&state.config.limits, &state.measured, state.said(at));
     let in_use = state.in_use();
     let running = state
         .running
@@ -1025,7 +1158,10 @@ fn report(shared: &Arc<Shared>, max_leases: usize) -> Value {
         ("arch", s(std::env::consts::ARCH)),
         ("threads", n(state.measured.threads)),
         ("memoryBytes", n64(state.measured.memory)),
-        ("offeredThreads", n(budget.threads.min(state.measured.threads))),
+        (
+            "offeredThreads",
+            n(budget.threads.min(state.measured.threads)),
+        ),
         ("offeredMemoryBytes", n64(budget.memory)),
         ("personPresent", Value::Bool(budget.person_present)),
         ("usedThreads", n(in_use.threads)),
@@ -1142,8 +1278,14 @@ fn send_report(galley: &machine::Galley, line: &str) -> Result<(), (Option<i32>,
         .arg("--identity")
         .arg(&galley.credential)
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
-        .env("HOME", std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
+        .env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+        )
+        .env(
+            "HOME",
+            std::env::var_os("HOME").unwrap_or_else(|| "/".into()),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
