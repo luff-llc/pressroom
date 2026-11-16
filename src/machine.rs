@@ -4,6 +4,7 @@ use crate::admit::{Kind, Limits, Measured, GB};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now() -> u64 {
@@ -262,6 +263,91 @@ pub fn parse_meminfo(text: &str) -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
+/// Processor ticks since boot, as `(busy, all)`.
+#[cfg(target_os = "macos")]
+fn processor_ticks() -> Option<(u64, u64)> {
+    extern "C" {
+        // From libSystem, which every program on macOS already links.
+        fn mach_host_self() -> u32;
+        fn host_statistics(host: u32, flavor: i32, info: *mut u32, count: *mut u32) -> i32;
+    }
+    const HOST_CPU_LOAD_INFO: i32 = 3;
+    static HOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // Ticks in the order user, system, idle, nice.
+    let mut ticks = [0u32; 4];
+    let mut count = ticks.len() as u32;
+    // SAFETY: `ticks` has room for the four counters this flavor writes, and `count`
+    // says so; the host port is the caller's own.
+    let result = unsafe {
+        let host = *HOST.get_or_init(|| mach_host_self());
+        host_statistics(host, HOST_CPU_LOAD_INFO, ticks.as_mut_ptr(), &mut count)
+    };
+    if result != 0 || count < 4 {
+        return None;
+    }
+    let [user, system, idle, nice] = ticks.map(u64::from);
+    Some((user + system + nice, user + system + nice + idle))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn processor_ticks() -> Option<(u64, u64)> {
+    parse_proc_stat(&fs::read_to_string("/proc/stat").ok()?)
+}
+
+/// The first line of Linux's `/proc/stat`: `cpu  user nice system idle iowait irq softirq
+/// steal ...`. Waiting on a disk is not use of the processor.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn parse_proc_stat(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().find(|l| l.starts_with("cpu "))?;
+    let n: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .take(8)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    if n.len() < 4 {
+        return None;
+    }
+    let all: u64 = n.iter().sum();
+    let idle = n[3] + n.get(4).copied().unwrap_or(0);
+    Some((all - idle, all))
+}
+
+/// Threads' worth of processor used between two readings of the ticks. The counters on
+/// macOS are 32 bits wide and wrap; a reading that went backwards gives nothing.
+pub fn busy_between(before: (u64, u64), after: (u64, u64), threads: u32) -> Option<f64> {
+    let all = after.1.checked_sub(before.1)?;
+    let busy = after.0.checked_sub(before.0)?;
+    (all > 0 && busy <= all).then(|| threads as f64 * busy as f64 / all as f64)
+}
+
+/// Threads' worth of processor in use since this was last asked, a few seconds ago. The
+/// first time, it reads twice a short moment apart.
+fn busy(threads: u32) -> Option<f64> {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(fixed) = std::env::var("PRESSROOM_TEST_LOAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            return Some(fixed);
+        }
+    }
+    static LAST: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let before = match *last {
+        Some(before) => before,
+        None => {
+            let first = processor_ticks()?;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            first
+        }
+    };
+    let after = processor_ticks()?;
+    *last = Some(after);
+    busy_between(before, after, threads)
+}
+
 fn load1() -> f64 {
     // Debug builds only, for tests: a fixed load, so that a busy machine does not change
     // their result.
@@ -325,10 +411,12 @@ pub fn parse_hid_idle(text: &str) -> Option<u64> {
 }
 
 pub fn measure(home: &Path) -> Measured {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
     Measured {
-        threads: std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(1),
+        threads,
+        busy: busy(threads),
         memory: total_memory(),
         disk_free: disk_free(home),
         load1: load1(),
@@ -340,6 +428,8 @@ pub fn measure(home: &Path) -> Measured {
 pub fn remeasure(home: &Path, m: &mut Measured) {
     m.disk_free = disk_free(home);
     m.load1 = load1();
+    // A reading over too short a time says little: keep the last one if this one fails.
+    m.busy = busy(m.threads).or(m.busy);
     m.idle_secs = idle_secs();
 }
 
@@ -481,6 +571,15 @@ mod tests {
     fn parsers() {
         assert_eq!(parse_load("5.65 6.56 5.72 2/1234 99"), Some(5.65));
         assert_eq!(parse_load("{ 30.12 6.56 5.72 }"), Some(30.12));
+        // user nice system idle iowait irq softirq steal: idle and iowait are not use.
+        let stat = "cpu  100 20 30 800 40 5 5 0 0 0\ncpu0 1 1 1 1 1 1 1 1 0 0\n";
+        assert_eq!(parse_proc_stat(stat), Some((160, 1000)));
+        assert_eq!(parse_proc_stat("intr 5\n"), None);
+        // A third of 16 threads in use between two readings.
+        assert_eq!(busy_between((100, 1000), (460, 2000), 16), Some(5.76));
+        // No time passed, or a counter wrapped: nothing to say.
+        assert_eq!(busy_between((100, 1000), (100, 1000), 16), None);
+        assert_eq!(busy_between((100, 1000), (50, 900), 16), None);
         assert_eq!(
             parse_meminfo("MemTotal:       32000000 kB\nMemFree: 1 kB"),
             Some(32_768_000_000)

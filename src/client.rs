@@ -39,6 +39,19 @@ fn connect(layout: &Layout) -> Result<UnixStream, String> {
     }
 }
 
+/// How long waiting work goes on looking for a daemon that went away.
+const REJOIN_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Connect and send a `run` request; the replies are read from the second half.
+fn join(layout: &Layout, line: &str) -> Result<(UnixStream, BufReader<UnixStream>), String> {
+    let mut stream = connect(layout)?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|_| "the daemon closed the connection".to_string())?;
+    let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    Ok((stream, reader))
+}
+
 fn ask(layout: &Layout, request: &Value) -> Result<Value, String> {
     let mut stream = connect(layout)?;
     let mut line = json::write(request);
@@ -125,23 +138,12 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
             obj(vec![("repo", s(repo)), ("toolchain", s(&args.toolchain))]),
         ));
     }
-    let mut stream = match connect(layout) {
-        Ok(stream) => stream,
-        Err(why) => {
-            eprintln!("pressroom: {why}");
-            return UNAVAILABLE;
-        }
-    };
     let mut line = json::write(&obj(request));
     line.push('\n');
-    if stream.write_all(line.as_bytes()).is_err() {
-        eprintln!("pressroom: the daemon closed the connection");
-        return UNAVAILABLE;
-    }
-    let mut reader = match stream.try_clone() {
-        Ok(clone) => BufReader::new(clone),
-        Err(e) => {
-            eprintln!("pressroom: {e}");
+    let (mut stream, mut reader) = match join(layout, &line) {
+        Ok(joined) => joined,
+        Err(why) => {
+            eprintln!("pressroom: {why}");
             return UNAVAILABLE;
         }
     };
@@ -151,8 +153,28 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
         let mut reply = String::new();
         match reader.read_line(&mut reply) {
             Ok(0) | Err(_) => {
-                eprintln!("pressroom: the daemon went away while this was waiting");
-                return UNAVAILABLE;
+                // The daemon stopped, most often to be replaced by a newer one. Work that
+                // was only waiting has lost nothing: join the new daemon's line (rule 22).
+                eprintln!("pressroom: the daemon went away while this was waiting; rejoining");
+                let until = std::time::Instant::now() + REJOIN_FOR;
+                let rejoined = loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    match join(layout, &line) {
+                        Ok(joined) => break Some(joined),
+                        Err(_) if std::time::Instant::now() < until => {}
+                        Err(_) => break None,
+                    }
+                };
+                let Some(joined) = rejoined else {
+                    eprintln!(
+                        "pressroom: no daemon came back within {} seconds",
+                        REJOIN_FOR.as_secs()
+                    );
+                    return UNAVAILABLE;
+                };
+                (stream, reader) = joined;
+                last_reason.clear();
+                continue;
             }
             Ok(_) => {}
         }
@@ -294,16 +316,19 @@ pub fn status(layout: &Layout, as_json: bool) -> i32 {
             _ => {}
         }
     }
+    let busy = match reply.num("busyThreads") {
+        Some(busy) => format!("{busy:.1} busy; load {:.1}", num("load1")),
+        None => format!("load {:.1}", num("load1")),
+    };
     println!(
-        "  threads  {} of {} offered in use ({} on the machine); load {:.1}",
+        "  threads  {} of {} offered in use ({} on the machine, {busy})",
         num("usedThreads"),
         num("offeredThreads"),
         num("threads"),
-        num("load1")
     );
     if num("outsideLoad") >= 1.0 {
         println!(
-            "           about {} threads of load were not started through pressroom",
+            "           about {} busy threads were not started through pressroom",
             num("outsideLoad")
         );
         for line in busiest() {
@@ -546,6 +571,7 @@ pub fn measure(layout: &Layout) -> i32 {
         ("memoryGb", n(m.memory as f64 / GB as f64)),
         ("diskFreeGb", n(m.disk_free as f64 / GB as f64)),
         ("load1", n(m.load1)),
+        ("busyThreads", m.busy.map_or(Value::Null, n)),
         ("idleSecs", m.idle_secs.map_or(Value::Null, n64)),
         ("toolchains", Value::Arr(tools)),
     ]);

@@ -53,7 +53,10 @@ workstation counts its person as present.
 2. Work is admitted only while what is already admitted plus the new work fits the offer,
    and while those plus load on the machine that pressroom did not admit fit the machine.
    So outside load is taken first from the threads the machine keeps back (its person's
-   share), and comes off the offer only once it passes them.
+   share), and comes off the offer only once it passes them. Outside load is the
+   processor in use, measured over the last few seconds, less what pressroom admitted.
+   The load average stands in only where processor use cannot be measured: it also counts
+   threads waiting on something else, and on a desktop runs several times above use.
 3. Work asking for more threads than the offer is given the offer. Work is given what is
    free if that is at least half of what it asked. It is never given more than is free.
 4. Work asking for more memory than the offer is refused, not queued.
@@ -117,6 +120,14 @@ A tool that is about to remove something uses `delete-begin`.
     comes first. A restart of the daemon forgets it. Each is written to `events.log`
     (`person_says`, and `person_says_ended` when it runs out).
 
+**When the daemon is replaced.**
+
+22. A daemon that stops forgets its line and what it admitted. Work that was waiting is
+    not failed by that: its `run` looks for a daemon for up to two minutes and joins the
+    new one's line, at the back of its class. Work that was running goes on undisturbed;
+    the new daemon did not admit it, so it counts as outside load (rule 2) until it ends,
+    and its leases, which are files, still stand.
+
 ## Lease file
 
 ```json
@@ -166,7 +177,8 @@ One object. Numbers in GB may have fractions; seconds are whole.
 | `personPresent` | Whether its person counts as present, after what they said |
 | `personSays` | Null, or `{"mode","holder","since","until"}` while a `hold` or `give` stands |
 | `usedThreads`, `usedMemoryGb` | What admitted work holds |
-| `load1`, `outsideLoad` | Load average, and the whole threads of it pressroom did not admit |
+| `busyThreads` | Threads' worth of processor in use over the last few seconds, by anything; null where it cannot be measured |
+| `load1`, `outsideLoad` | Load average, and the whole busy threads pressroom did not admit (rule 2) |
 | `diskFreeGb`, `diskFloorGb` | Free disk and the floor below which nothing new starts |
 | `toolchains` | `[{"name","version"}]`, for `rustc`, `cargo`, `bun`, `node` and `xcode`: the first copy that answers, on the daemon's PATH, then in `/opt/homebrew/bin`, `/usr/local/bin`, and under the home folder `.local/bin`, `.cargo/bin`, `.local/share/mise/shims`, `.bun/bin`, and the newest `.rustup/toolchains/*/bin` and `.nvm/versions/node/*/bin` |
 | `managed` | The managed folders |
@@ -195,8 +207,7 @@ replaced by a default. A connection that sends nothing for ten seconds is closed
 
 - **It cannot stop work started outside it.** It counts that load against the machine
   (rule 2) and shows it in `status`, with the programs using the most processor, so its
-  own work backs off when the machine is full. Load is the one-minute load average, which
-  runs higher than processor use on a busy desktop.
+  own work backs off when the machine is full.
 - **It does not cap a running job.** It tells the job how many threads to use through
   `PRESSROOM_THREADS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `MAKEFLAGS` and
   `CMAKE_BUILD_PARALLEL_LEVEL`, and lowers the priority of batch work. A command that
