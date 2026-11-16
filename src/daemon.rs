@@ -43,6 +43,8 @@ struct Job {
     lease_ids: Vec<String>,
     /// It holds a device slot (rule 27).
     device: bool,
+    /// It asked for one; inside a job that holds one it shares that job's (rule 26).
+    asked_device: bool,
     /// The job it runs inside (rule 26); charged nothing of its own.
     within: Option<String>,
     /// What `run` last measured it to use: threads and bytes (rule 24).
@@ -51,8 +53,9 @@ struct Job {
     held_secs: f64,
     /// How `run` holds it: `scope`, `stop` or `measure`; `within` for rule 26.
     means: Option<String>,
-    /// Its process group and processes, to continue if its `run` dies (rule 28).
+    /// Its process groups and loose processes, to continue if its `run` dies (rule 28).
     pgid: Option<i32>,
+    groups: Vec<i32>,
     pids: Vec<i32>,
 }
 
@@ -68,8 +71,8 @@ impl Job {
 
 struct Waiter {
     request: Request,
-    /// Waiting inside a running job (rule 26): it holds up no one.
-    within: bool,
+    /// The job it waits inside (rule 26). While that job runs, it holds up no one.
+    within: Option<String>,
     holder: String,
     label: String,
     since: u64,
@@ -536,7 +539,7 @@ fn run(
                 memory,
                 device,
             },
-            within: within.is_some(),
+            within: within.clone(),
             holder: holder.clone(),
             label: label.clone(),
             since: now(),
@@ -561,8 +564,12 @@ fn run(
             .waiting
             .iter()
             .filter(|w| {
+                let inside = w
+                    .within
+                    .as_ref()
+                    .is_some_and(|id| state.running.iter().any(|j| &j.id == id));
                 w.request.seq == seq
-                    || !(w.within || admit::waits_for_device(&limits, in_use, &w.request))
+                    || !(inside || admit::waits_for_device(&limits, in_use, &w.request))
             })
             .map(|w| w.request.clone())
             .collect();
@@ -651,7 +658,7 @@ fn run(
                     &leased,
                     &lease_kind,
                     pid,
-                    me.device,
+                    (me.device, device),
                     outer.as_ref().map(|o| o.0.clone()),
                 ) {
                     Ok(job) => job,
@@ -749,7 +756,7 @@ fn run(
                 }
                 Some("event") => {
                     let event = line.str("event").unwrap_or("");
-                    if ["held", "memory_ended", "not_held"].contains(&event) {
+                    if ["held", "memory_ended", "not_held", "on_its_own"].contains(&event) {
                         shared.event(vec![
                             ("event", s(event)),
                             ("job", s(&job_id)),
@@ -765,7 +772,19 @@ fn run(
     let ended = {
         let mut state = shared.lock();
         let at = state.running.iter().position(|j| j.id == job_id);
-        at.map(|i| state.running.remove(i))
+        let ended = at.map(|i| state.running.remove(i));
+        // Runs inside this job become jobs of their own, charged and holding a device slot
+        // if they asked for one, under the same lock, so nothing is admitted in their
+        // place meanwhile (rule 26). Their `run`s see this job's `run` gone and hold them.
+        for inner in state
+            .running
+            .iter_mut()
+            .filter(|j| j.within.as_deref() == Some(job_id.as_str()))
+        {
+            inner.within = None;
+            inner.device = inner.asked_device;
+        }
+        ended
     };
     if outcome == Value::Null {
         if let Some(job) = &ended {
@@ -834,17 +853,28 @@ fn took_use(job: &mut Job, line: &Value) {
     if let Some(pgid) = line.u64("pgid").and_then(|p| i32::try_from(p).ok()) {
         job.pgid = Some(pgid);
     }
-    if let Some(Value::Arr(items)) = line.get("pids") {
-        job.pids = items
-            .iter()
-            .filter_map(|v| match v {
-                Value::Num(p) if p.fract() == 0.0 && *p > 1.0 && *p < i32::MAX as f64 => {
-                    Some(*p as i32)
-                }
-                _ => None,
-            })
-            .take(crate::cap::MAX_REPORTED)
-            .collect();
+    let ids = |key: &str| -> Option<Vec<i32>> {
+        let Some(Value::Arr(items)) = line.get(key) else {
+            return None;
+        };
+        Some(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Num(p) if p.fract() == 0.0 && *p > 1.0 && *p < i32::MAX as f64 => {
+                        Some(*p as i32)
+                    }
+                    _ => None,
+                })
+                .take(crate::cap::MAX_REPORTED)
+                .collect(),
+        )
+    };
+    if let Some(groups) = ids("groups") {
+        job.groups = groups;
+    }
+    if let Some(pids) = ids("pids") {
+        job.pids = pids;
     }
 }
 
@@ -855,8 +885,11 @@ fn continue_job(job: &Job) {
         return;
     }
     let me = std::process::id() as i32;
-    if let Some(pgid) = job.pgid.filter(|&g| g > 1 && g != me) {
-        crate::cap::sys::kill(-pgid, crate::cap::sys::SIGCONT);
+    let my_group = crate::cap::sys::own_group();
+    for &g in job.pgid.iter().chain(&job.groups) {
+        if g > 1 && g != me && g != my_group {
+            crate::cap::sys::kill(-g, crate::cap::sys::SIGCONT);
+        }
     }
     for &pid in job.pids.iter().filter(|&&p| p > 1 && p != me) {
         crate::cap::sys::kill(pid, crate::cap::sys::SIGCONT);
@@ -878,7 +911,7 @@ fn start(
     leased: &[PathBuf],
     lease_kind: &str,
     pid: Option<u32>,
-    device: bool,
+    (device, asked_device): (bool, bool),
     within: Option<String>,
 ) -> Result<Started, String> {
     let at = now();
@@ -947,12 +980,14 @@ fn start(
         started: at,
         lease_ids: lease_ids.clone(),
         device,
+        asked_device,
         means: within.as_ref().map(|_| "within".to_string()),
         within: within.clone(),
         used: None,
         held: false,
         held_secs: 0.0,
         pgid: None,
+        groups: Vec::new(),
         pids: Vec::new(),
     });
     Ok((job_id, threads, lane_path, lease_ids, within))

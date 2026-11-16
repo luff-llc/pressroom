@@ -1152,6 +1152,7 @@ fn a_run_inside_a_job_is_part_of_it() {
     let out = m
         .command(&["run", "--", "sh", "-c", "echo $PRESSROOM_THREADS"])
         .env("PRESSROOM_JOB", "j-1-1")
+        .env("PRESSROOM_JOB_PID", std::process::id().to_string())
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -1261,4 +1262,73 @@ fn a_tool_that_runs_commands_in_groups_of_their_own_is_still_held() {
         assert!(used > 0.5 && used < 9.0, "{cap}: the spinners used {used:.1}s in 5s\n{}", text(&out.stdout));
         assert!(text(&out.stderr).contains("held to 1"), "{cap}: {}", text(&out.stderr));
     }
+}
+
+#[test]
+fn a_run_left_behind_by_its_job_becomes_a_job_of_its_own() {
+    // The outer command starts a build through pressroom in the background and ends at
+    // once. The build must not go on unheld and uncharged (rule 26).
+    let m = Machine::start("orphan", &format!("{WORKER}cap = stop\n"));
+    let timed = m.home.join("times");
+    let inner = format!(
+        "{BIN} run --threads 1 --label inner -- sh -c '{} > {}' &",
+        spinner(4, 4),
+        timed.display()
+    );
+    let started = Instant::now();
+    let out = m
+        .command(&["run", "--threads", "8", "--label", "outer", "--", "sh", "-c", &inner])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    let times = wait_file(&timed, |t| t.lines().count() >= 2);
+    let wall = started.elapsed().as_secs_f64();
+    let threads = children_cpu(&times) / wall;
+    assert!(stderr.contains("now a job of its own"), "{stderr}");
+    assert!(threads < 1.6, "the left-behind build used {threads:.2} threads on 1\n{stderr}");
+    let events = fs::read_to_string(m.home.join("events.log")).unwrap();
+    assert!(events.contains("\"event\":\"on_its_own\""), "{events}");
+}
+
+#[test]
+fn a_killed_run_leaves_no_group_of_its_job_stopped() {
+    // A second process group whose parent lives is not hung up by the system when `run`
+    // dies; only the daemon continues it (rule 28).
+    if Command::new("perl").arg("-e1").status().map_or(true, |s| !s.success()) {
+        eprintln!("no perl here; skipped");
+        return;
+    }
+    let m = Machine::start("killed2", &format!("{WORKER}cap = stop\n"));
+    let pids = m.home.join("pids");
+    let script = format!(
+        r#"$SIG{{HUP}} = "IGNORE"; setpgrp(0,0); open(my $f, ">", "{0}"); my @p;
+           for (1..3) {{ my $k = fork; if (!$k) {{ 1 while 1 }} push @p, $k }}
+           print $f join(" ", @p, $$); close $f; sleep 60;"#,
+        pids.display()
+    );
+    let mut run = m
+        .command(&["run", "--threads", "1", "--", "sh", "-c", "trap '' HUP; perl -e \"$1\"", "sh", &script])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    m.wait_for("the job held", |s| s.contains("\"held\":true"));
+    run.kill().unwrap();
+    run.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let listed = fs::read_to_string(&pids).unwrap();
+    let pids: Vec<&str> = listed.split_whitespace().collect();
+    let mut states = String::new();
+    for _ in 0..5 {
+        let out = Command::new("ps").args(["-o", "stat=", "-p", &pids.join(",")]).output().unwrap();
+        states = text(&out.stdout);
+        if !states.contains('T') {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for pid in &pids {
+        let _ = Command::new("kill").args(["-9", pid]).status();
+    }
+    assert!(!states.is_empty() && !states.contains('T'), "left stopped: {states}");
 }

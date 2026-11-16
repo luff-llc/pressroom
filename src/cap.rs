@@ -18,10 +18,10 @@ pub const TICK: Duration = Duration::from_millis(50);
 /// How often `run` tells the daemon what its job uses.
 pub const REPORT_EVERY: Duration = Duration::from_secs(2);
 /// The most processes one job is watched for. Beyond this, new ones are held by their
-/// process group only.
-const MAX_TRACKED: usize = 4096;
-/// The most process ids sent to the daemon in one report (rule 28).
-pub const MAX_REPORTED: usize = 512;
+/// process group only, and the job is told.
+const MAX_TRACKED: usize = 8192;
+/// The most process groups and loose processes sent to the daemon in one line (rule 28).
+pub const MAX_REPORTED: usize = 4096;
 /// A job may run ahead of its grant by this many seconds of its grant before it is held.
 const BURST_SECS: f64 = 0.2;
 
@@ -34,6 +34,8 @@ pub enum Means {
     Stop,
     /// Measured, not held (`cap = measure`).
     Measure,
+    /// Part of another job, whose hold holds it (rule 26), until that job ends.
+    Within,
 }
 
 impl Means {
@@ -42,6 +44,7 @@ impl Means {
             Means::Scope(_) => "scope",
             Means::Stop => "stop",
             Means::Measure => "measure",
+            Means::Within => "within",
         }
     }
 }
@@ -152,7 +155,11 @@ pub struct Tracker {
     pgid: i32,
     known: HashMap<i32, u64>,
     groups: HashSet<i32>,
+    /// The groups of the processes found at the last look, by process.
+    of: HashMap<i32, i32>,
     looks: u64,
+    /// More processes than are watched.
+    pub crowded: bool,
 }
 
 /// On Linux listing a group's members means reading every process, so it is done every
@@ -166,14 +173,37 @@ impl Tracker {
             pgid,
             known: HashMap::new(),
             groups: HashSet::new(),
+            of: HashMap::new(),
             looks: 0,
+            crowded: false,
         }
     }
 
     /// The process groups the job's processes are in, its own first.
     pub fn groups(&self) -> Vec<i32> {
+        let mut rest: Vec<i32> = self
+            .groups
+            .iter()
+            .copied()
+            .filter(|&g| g != self.pgid)
+            .collect();
+        rest.sort_unstable();
         let mut out = vec![self.pgid];
-        out.extend(self.groups.iter().copied().filter(|&g| g != self.pgid));
+        out.extend(rest);
+        out
+    }
+
+    /// The job's processes outside all of its groups: a process that made a session of its
+    /// own, say. A group is reached by one signal; these each need their own.
+    pub fn loose(&self) -> Vec<i32> {
+        let groups = self.groups();
+        let mut out: Vec<i32> = self
+            .of
+            .iter()
+            .filter(|(_, g)| !groups.contains(g))
+            .map(|(&pid, _)| pid)
+            .collect();
+        out.sort_unstable();
         out
     }
 
@@ -185,7 +215,7 @@ impl Tracker {
         let mut listed: HashSet<i32> = HashSet::new();
         let mut todo: Vec<i32> = vec![self.root];
         todo.extend(self.known.keys().copied());
-        let list_known = self.looks % GROUP_EVERY == 1 || GROUP_EVERY == 1;
+        let list_known = (self.looks - 1).checked_rem(GROUP_EVERY) == Some(0);
         let mut all: HashMap<i32, Sample> = HashMap::new();
         let mut looked: HashSet<i32> = HashSet::new();
         let mut accepted: HashSet<i32> = HashSet::new();
@@ -201,7 +231,11 @@ impl Tracker {
                 todo.extend(sys::members(&fresh));
             }
             while let Some(pid) = todo.pop() {
-                if pid <= 1 || !looked.insert(pid) || looked.len() > MAX_TRACKED {
+                if looked.len() >= MAX_TRACKED {
+                    self.crowded = true;
+                    continue;
+                }
+                if pid <= 1 || !looked.insert(pid) {
                     continue;
                 }
                 if let Some(sample) = sys::sample(pid) {
@@ -241,6 +275,7 @@ impl Tracker {
             .filter(|s| accepted.contains(&s.pid))
             .collect();
         self.known = out.iter().map(|s| (s.pid, s.start)).collect();
+        self.of = out.iter().map(|s| (s.pid, s.pgid)).collect();
         self.groups = groups;
         out
     }
@@ -260,6 +295,13 @@ pub struct Use {
     pub memory: Option<u64>,
     pub held: bool,
     pub held_secs: f64,
+}
+
+/// What a job held by stopping may be stopped by: its process groups, and its processes
+/// outside them. The daemon is told these before any stop (rule 28).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Targets {
+    pub groups: Vec<i32>,
     pub pids: Vec<i32>,
 }
 
@@ -275,6 +317,7 @@ pub struct Watch {
     stopped_since: Option<Instant>,
     held_secs: f64,
     told_held: bool,
+    told_crowded: bool,
     held_in_window: bool,
     last_tick: Instant,
     last_cpu: f64,
@@ -282,10 +325,12 @@ pub struct Watch {
     reported_cpu: f64,
     memory: Option<u64>,
     pids: Vec<i32>,
+    targets: Targets,
     /// Asked to end: it is no longer held, so it can end promptly.
     letting_go: bool,
     // A scope's counters at the last report.
     throttled: u64,
+    periods: u64,
     oom_kills: u64,
 }
 
@@ -300,12 +345,13 @@ fn threads_word(n: u32) -> String {
 impl Watch {
     pub fn new(means: Means, root: i32, pgid: i32, grant: u32, memory_cap: u64) -> Watch {
         let now = Instant::now();
-        let (throttled, oom_kills) = match &means {
+        let (throttled, periods, oom_kills) = match &means {
             Means::Scope(dir) => (
                 scope_counter(dir, "cpu.stat", "nr_throttled").unwrap_or(0),
+                scope_counter(dir, "cpu.stat", "nr_periods").unwrap_or(0),
                 scope_counter(dir, "memory.events", "oom_kill").unwrap_or(0),
             ),
-            _ => (0, 0),
+            _ => (0, 0, 0),
         };
         Watch {
             means,
@@ -318,6 +364,7 @@ impl Watch {
             stopped_since: None,
             held_secs: 0.0,
             told_held: false,
+            told_crowded: false,
             held_in_window: false,
             last_tick: now,
             last_cpu: 0.0,
@@ -325,15 +372,41 @@ impl Watch {
             reported_cpu: 0.0,
             memory: None,
             pids: Vec::new(),
+            targets: Targets {
+                groups: vec![pgid],
+                pids: vec![root],
+            },
             letting_go: false,
             throttled,
+            periods,
             oom_kills,
         }
     }
 
+    /// What it may be stopped by, as last told to the daemon.
+    pub fn targets(&self) -> &Targets {
+        &self.targets
+    }
+
+    /// The job this ran inside has ended (rule 26): from now on it holds itself, by
+    /// stopping, to what it was given.
+    pub fn on_its_own(&mut self) -> Notice {
+        self.means = Means::Stop;
+        self.bucket = Bucket::new(self.grant as f64);
+        self.last_tick = Instant::now();
+        Notice {
+            event: "on_its_own",
+            text: format!(
+                "the job this ran inside has ended; it is now a job of its own, held to {}",
+                threads_word(self.grant)
+            ),
+        }
+    }
+
     /// Look at the job once; called every `TICK`. Holds or releases a job held by
-    /// stopping. Returns what the job is to be told.
-    pub fn tick(&mut self) -> Vec<Notice> {
+    /// stopping. `before_stop` is given the targets whenever they changed, before they
+    /// are stopped. Returns what the job is to be told.
+    pub fn tick(&mut self, before_stop: &mut dyn FnMut(&Targets)) -> Vec<Notice> {
         let mut notices = Vec::new();
         if let Means::Scope(dir) = &self.means {
             // A scope needs nothing between reports but a look at its memory events.
@@ -357,19 +430,38 @@ impl Watch {
         let secs = now.duration_since(self.last_tick).as_secs_f64();
         self.last_tick = now;
         let used = self.look();
+        if self.tracker.crowded && !self.told_crowded {
+            self.told_crowded = true;
+            notices.push(Notice {
+                event: "not_held",
+                text: format!(
+                    "this job has more than {MAX_TRACKED} processes; those beyond are held \
+                     only through their process groups"
+                ),
+            });
+        }
         let hold = self.bucket.spend(secs, used) && !self.letting_go;
-        if hold && !self.stopped {
-            self.signal(sys::SIGSTOP);
-            self.stopped = true;
-            self.stopped_since = Some(now);
-            self.held_in_window = true;
-            if !self.told_held {
-                self.told_held = true;
-                notices.push(self.held_notice());
+        if hold {
+            // Tell the daemon first what is about to be stopped, so a `run` killed while
+            // its job is stopped leaves nothing it does not know of.
+            let targets = Targets {
+                groups: self.tracker.groups(),
+                pids: self.tracker.loose(),
+            };
+            if targets != self.targets {
+                before_stop(&targets);
+                self.targets = targets;
             }
-        } else if hold {
-            // Processes that appeared since it was stopped.
             self.signal(sys::SIGSTOP);
+            if !self.stopped {
+                self.stopped = true;
+                self.stopped_since = Some(now);
+                self.held_in_window = true;
+                if !self.told_held {
+                    self.told_held = true;
+                    notices.push(self.held_notice());
+                }
+            }
         } else if self.stopped {
             self.release();
         }
@@ -442,26 +534,41 @@ impl Watch {
         let (cpu, held) = match &self.means {
             Means::Scope(dir) => {
                 let cpu = scope_counter(dir, "cpu.stat", "usage_usec").map(|us| us as f64 / 1e6);
-                self.memory = scope_counter(dir, "memory.current", "");
+                // The working set: what the scope holds less file cache it is not using,
+                // which the kernel takes back before it would end anything.
+                self.memory = scope_counter(dir, "memory.current", "").map(|current| {
+                    current.saturating_sub(
+                        scope_counter(dir, "memory.stat", "inactive_file").unwrap_or(0),
+                    )
+                });
                 let throttled = scope_counter(dir, "cpu.stat", "nr_throttled").unwrap_or(0);
-                let periods = throttled.saturating_sub(self.throttled);
-                self.throttled = throttled;
-                let held = periods as f64 * scope_period(dir) >= secs * 0.1;
-                self.held_secs += periods as f64 * scope_period(dir);
+                let periods = scope_counter(dir, "cpu.stat", "nr_periods").unwrap_or(0);
+                let (throttled_now, periods_now) = (
+                    throttled.saturating_sub(self.throttled),
+                    periods.saturating_sub(self.periods),
+                );
+                (self.throttled, self.periods) = (throttled, periods);
+                // Held back: throttled in at least half the periods it wanted to run in.
+                // A short burst past the quota now and then is not that.
+                let held = periods_now > 0 && throttled_now * 2 >= periods_now;
+                // The periods in which the kernel throttled it: an upper bound.
+                self.held_secs += throttled_now as f64 * scope_period(dir);
                 if held && !self.told_held {
                     self.told_held = true;
                     notices.push(self.held_notice());
                 }
                 (cpu, held)
             }
-            means => {
-                if *means == Means::Measure {
-                    self.look();
-                }
+            Means::Measure => {
+                self.look();
+                (Some(self.last_cpu), false)
+            }
+            Means::Stop => {
                 let held = self.held_in_window || self.stopped;
                 self.held_in_window = self.stopped;
                 (Some(self.last_cpu), held)
             }
+            Means::Within => (None, false),
         };
         let threads = cpu.map(|cpu| {
             let t = (cpu - self.reported_cpu).max(0.0) / secs;
@@ -472,15 +579,12 @@ impl Watch {
         if let Some(since) = self.stopped_since {
             held_secs += since.elapsed().as_secs_f64();
         }
-        let mut pids = self.pids.clone();
-        pids.truncate(MAX_REPORTED);
         (
             Use {
                 threads,
                 memory: self.memory,
                 held,
                 held_secs,
-                pids,
             },
             notices,
         )
@@ -489,7 +593,7 @@ impl Watch {
     /// The job's first process has ended: continue anything still stopped, and say for
     /// how long it was held back.
     pub fn finish(&mut self) -> (f64, Vec<Notice>) {
-        let notices = self.tick();
+        let notices = self.tick(&mut |_| {});
         self.release();
         if let Means::Scope(_) = self.means {
             let _ = self.report();
@@ -783,6 +887,25 @@ pub mod sys {
                 .collect()
         }
 
+        /// Whether a process exists and has not ended. One that has ended but whose parent
+        /// has not yet waited for it (a zombie) still answers a signal, so ask its state.
+        pub fn running(pid: i32) -> bool {
+            const SZOMB: u32 = 5;
+            let mut info = [0u8; BSDINFO_SIZE];
+            // SAFETY: the buffer is the size of struct proc_bsdinfo.
+            let n = unsafe {
+                proc_pidinfo(
+                    pid,
+                    PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    BSDINFO_SIZE as i32,
+                )
+            };
+            n as usize == BSDINFO_SIZE
+                && u32::from_ne_bytes(info[4..8].try_into().unwrap()) != SZOMB
+        }
+
         /// Nanoseconds per unit of the processor times rusage gives. On Apple silicon they
         /// are in the machine's time base, not nanoseconds.
         fn ns_per_unit() -> f64 {
@@ -915,13 +1038,22 @@ pub mod sys {
             })
         }
 
+        /// Whether a process exists and has not ended (a zombie has).
+        pub fn running(pid: i32) -> bool {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|t| {
+                t.rfind(')')
+                    .and_then(|at| t[at + 1..].split_whitespace().next())
+                    .is_some_and(|state| state != "Z")
+            })
+        }
+
         pub fn sample(pid: i32) -> Option<Sample> {
             let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             parse_stat(&text, conf(SC_CLK_TCK, 100.0), conf(SC_PAGESIZE, 4096.0))
         }
     }
 
-    pub use os::{children, members, sample};
+    pub use os::{children, members, running, sample};
 }
 
 #[cfg(test)]
@@ -1018,6 +1150,21 @@ mod tests {
         let s = sys::os::parse_stat(text, 100.0, 4096.0).unwrap();
         assert_eq!((s.pid, s.ppid, s.pgid, s.start), (4242, 4000, 4242, 98765));
         assert_eq!((s.own, s.children, s.memory), (2.0, 4.0, 256 * 4096));
+    }
+
+    #[test]
+    fn a_zombie_is_not_running() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        let until = Instant::now() + Duration::from_secs(5);
+        while sys::running(pid) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Ended, not yet waited for: it still answers a signal, but it is not running.
+        assert!(sys::kill(pid, 0));
+        assert!(!sys::running(pid));
+        child.wait().unwrap();
+        assert!(sys::running(std::process::id() as i32));
     }
 
     #[test]

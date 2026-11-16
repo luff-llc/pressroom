@@ -144,8 +144,14 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
     if args.device {
         request.push(("device", Value::Bool(true)));
     }
-    // Started inside a running job: part of it (rule 26).
-    if let Ok(outer) = std::env::var("PRESSROOM_JOB") {
+    // Started inside a running job: part of it (rule 26). Only where that job's `run`
+    // saw a daemon that knows rule 26 (it then sets PRESSROOM_JOB_PID): an older daemon
+    // would queue this behind the job it is part of.
+    let outer_run: Option<u32> = std::env::var("PRESSROOM_JOB_PID")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .filter(|&p| p > 1);
+    if let (Ok(outer), Some(_)) = (std::env::var("PRESSROOM_JOB"), outer_run) {
         if !outer.is_empty() && outer.len() <= 64 {
             request.push(("within", s(outer)));
         }
@@ -230,23 +236,22 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
         );
     }
 
-    // Inside another job (rule 26): that job's hold holds this one too.
+    // Inside another job (rule 26): that job's hold holds this one too, until it ends.
     let inside = admitted.str("within").is_some();
+    // A daemon that knows rules 23 to 28 says how it holds work.
+    let knows_rule_26 = admitted.str("cap").is_some();
     let granted: u32 = threads.parse().unwrap_or(1);
     let cap_memory = admitted
         .num("capMemoryGb")
         .filter(|g| g.is_finite() && *g > 0.0)
         .map(|g| (g * GB as f64) as u64);
-    let means = if inside {
-        None
-    } else {
-        Some(match admitted.str("cap") {
-            Some("measure") => Means::Measure,
-            Some("stop") => Means::Stop,
-            // `hold`, and a daemon too old to say: the best means here.
-            _ if cap::scope_works() => Means::Scope(std::path::PathBuf::new()),
-            _ => Means::Stop,
-        })
+    let means = match admitted.str("cap") {
+        _ if inside => Means::Within,
+        Some("measure") => Means::Measure,
+        Some("stop") => Means::Stop,
+        // `hold`, and a daemon too old to say: the best means here.
+        _ if cap::scope_works() => Means::Scope(std::path::PathBuf::new()),
+        _ => Means::Stop,
     };
 
     let mut argv: Vec<String> = Vec::new();
@@ -256,7 +261,7 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
     argv.extend(args.command.iter().cloned());
     let unit = cap::scope_unit(&job);
     let mut bus_env = None;
-    if let Some(Means::Scope(_)) = means {
+    if let Means::Scope(_) = means {
         // A program that cannot be found gives 127, not systemd-run's own failure.
         if cap::find_program(&args.command[0]).is_none() {
             eprintln!("pressroom: cannot start {}: not found", args.command[0]);
@@ -289,9 +294,12 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
     if let Some((k, v)) = bus_env {
         command.env(k, v);
     }
-    if !inside {
-        // Its own process group, so all of it can be held, and passed a signal, at once.
-        command.process_group(0);
+    // Its own process group, so all of it can be held, and passed a signal, at once.
+    command.process_group(0);
+    if knows_rule_26 {
+        command.env("PRESSROOM_JOB_PID", std::process::id().to_string());
+    } else {
+        command.env_remove("PRESSROOM_JOB_PID");
     }
     command
         .env("PRESSROOM_JOB", &job)
@@ -312,8 +320,9 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
     let (exit, started, held_secs, held_by) = match command.spawn() {
         Ok(child) => {
+            let outer = if inside { outer_run } else { None };
             let (status, held_secs, held_by) =
-                watch(&mut stream, child, means, granted, cap_memory, &unit);
+                watch(&mut stream, child, means, granted, cap_memory, &unit, outer);
             // A command ended by a signal reports 128 plus the signal, as a shell does.
             let code = status
                 .and_then(|status| status.code().or_else(|| status.signal().map(|sig| 128 + sig)))
@@ -392,20 +401,56 @@ fn tell(stream: &mut UnixStream, notices: Vec<Notice>) {
     }
 }
 
+/// Tell the daemon how the job is held and what it may be stopped by (rules 24 and 28),
+/// with what it used when that is known.
+fn send_use(stream: &mut UnixStream, w: &Watch, pid: i32, used: Option<&cap::Use>) {
+    send_targets(stream, w.means.name(), pid, w.targets(), used);
+}
+
+fn send_targets(
+    stream: &mut UnixStream,
+    means: &str,
+    pid: i32,
+    targets: &cap::Targets,
+    used: Option<&cap::Use>,
+) {
+    let mut fields = vec![
+        ("op", s("use")),
+        ("means", s(means)),
+        ("pgid", n(pid)),
+        (
+            "groups",
+            Value::Arr(targets.groups.iter().take(cap::MAX_REPORTED).map(|&g| n(g)).collect()),
+        ),
+        (
+            "pids",
+            Value::Arr(targets.pids.iter().take(cap::MAX_REPORTED).map(|&p| n(p)).collect()),
+        ),
+    ];
+    if let Some(used) = used {
+        fields.push(("held", Value::Bool(used.held)));
+        fields.push(("heldSecs", n((used.held_secs * 10.0).round() / 10.0)));
+        if let (Some(threads), Some(memory)) = (used.threads, used.memory) {
+            fields.push(("threads", n((threads * 100.0).round() / 100.0)));
+            fields.push(("memoryGb", n((memory as f64 / GB as f64 * 100.0).round() / 100.0)));
+        }
+    }
+    send_line(stream, &obj(fields));
+}
+
 /// Wait for the job, holding it to its grant and saying what it uses (rules 23 to 25).
-/// Returns how it ended, for how many seconds it was held back, and by what means.
+/// `outer` is the `run` of the job this one is part of (rule 26): once it is gone, this
+/// one holds itself. Returns how it ended, for how many seconds it was held back, and by
+/// what means.
 fn watch(
     stream: &mut UnixStream,
     mut child: std::process::Child,
-    means: Option<Means>,
+    mut means: Means,
     granted: u32,
     cap_memory: Option<u64>,
     unit: &str,
+    outer: Option<u32>,
 ) -> (Option<std::process::ExitStatus>, f64, Option<&'static str>) {
-    let Some(mut means) = means else {
-        // Inside another job: nothing of its own to hold.
-        return (child.wait().ok(), 0.0, None);
-    };
     let pid = child.id() as i32;
     if let Means::Scope(_) = means {
         // systemd-run makes the scope, then becomes the command. Should no scope appear,
@@ -423,7 +468,10 @@ fn watch(
     }
     cap::sys::catch_endings();
     let gave_terminal = cap::sys::give_terminal(pid);
-    if means == Means::Measure {
+    let mut w = Watch::new(means, pid, pid, granted, cap_memory.unwrap_or(0));
+    // Before anything can be stopped, the daemon knows how and what (rule 28).
+    send_use(stream, &w, pid, None);
+    if w.means == Means::Measure {
         tell(
             stream,
             vec![Notice {
@@ -434,7 +482,6 @@ fn watch(
             }],
         );
     }
-    let mut w = Watch::new(means, pid, pid, granted, cap_memory.unwrap_or(0));
     let mut last_report = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -442,7 +489,14 @@ fn watch(
             Ok(None) => {}
             Err(_) => break None,
         }
-        let notices = w.tick();
+        if w.means == Means::Within && outer.is_some_and(|run| !cap::sys::running(run as i32)) {
+            // The job this was part of has ended; the daemon now charges this one.
+            let notice = w.on_its_own();
+            tell(stream, vec![notice]);
+            send_use(stream, &w, pid, None);
+        }
+        // Told before they are stopped, so a `run` killed meanwhile leaves none unknown.
+        let notices = w.tick(&mut |targets| send_targets(stream, "stop", pid, targets, None));
         tell(stream, notices);
         if let Some(sig) = cap::sys::take_caught() {
             // Asked to end: pass it on, and hold the job no more so it can end promptly.
@@ -453,24 +507,7 @@ fn watch(
             last_report = std::time::Instant::now();
             let (used, notices) = w.report();
             tell(stream, notices);
-            if let (Some(threads), Some(memory)) = (used.threads, used.memory) {
-                send_line(
-                    stream,
-                    &obj(vec![
-                        ("op", s("use")),
-                        ("threads", n((threads * 100.0).round() / 100.0)),
-                        ("memoryGb", n((memory as f64 / GB as f64 * 100.0).round() / 100.0)),
-                        ("held", Value::Bool(used.held)),
-                        ("heldSecs", n((used.held_secs * 10.0).round() / 10.0)),
-                        ("means", s(w.means.name())),
-                        ("pgid", n(pid)),
-                        (
-                            "pids",
-                            Value::Arr(used.pids.iter().map(|&p| n(p)).collect()),
-                        ),
-                    ]),
-                );
-            }
+            send_use(stream, &w, pid, Some(&used));
         }
         std::thread::sleep(cap::TICK);
     };
@@ -479,7 +516,8 @@ fn watch(
     if gave_terminal {
         cap::sys::take_terminal();
     }
-    (status, held_secs, Some(w.means.name()))
+    let held_by = (w.means != Means::Within).then(|| w.means.name());
+    (status, held_secs, held_by)
 }
 
 pub fn status(layout: &Layout, as_json: bool) -> i32 {

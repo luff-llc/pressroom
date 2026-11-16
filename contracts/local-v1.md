@@ -154,30 +154,42 @@ holding 12 threads between them put a laptop's load average at 385.
     job is measured and charged but not held.
 24. The daemon charges each running job the larger of its grant and what it was last
     measured to use, in threads (rounded) and in memory, when it admits work (rules 2 and
-    3). `run` measures every two seconds: in a Linux scope, from the scope's own counters;
-    elsewhere, by adding up the processor time and memory of the job's processes, with
-    the time of children that have ended. `status` shows use against grant and flags a
+    3). `run` measures every two seconds: in a Linux scope, from the scope's own counters
+    (memory is its working set: what it holds less file cache it is not using);
+    elsewhere, by adding up the processor time and memory (resident on Linux, footprint on
+    macOS) of the job's processes, with the time of children that have ended. `status` shows use against grant and flags a
     job that is over: more than a quarter, and at least half a thread, above its
     threads, or above its memory.
 25. A job is told on its standard error, in one plain line each: when it is first held
     back (it tried to use more than its grant and now runs slower), when the system ended
     a process of it for passing the memory cap, and when it cannot be held here and is
     only measured. The daemon writes the same to `events.log` (`held`, `memory_ended`,
-    `not_held`), and the job's `ended` event says how many seconds it was held back
-    (`heldSecs`). Pressroom never ends a job itself.
-26. A `run` started inside a running job (it sees that job's `PRESSROOM_JOB`) is part of
-    that job. It is admitted at once, charged nothing, given at most the outer job's
-    threads, and gets its own lane and leases as usual. It sets up no hold of its own; the
-    outer job's holds it. So a whole tool run, `pressroom run -- codex exec …`, is one
-    job: the builds the tool starts through pressroom inside it neither wait for the
-    machine nor take more of it. A `PRESSROOM_JOB` that names no running job is ignored.
+    `not_held`, and `on_its_own` for rule 26), and the job's `ended` event says how it was
+    held (`means`) and for how many seconds it was held back (`heldSecs`: the time it was
+    stopped; for a scope, the tenths of a second in which the kernel throttled it at all,
+    which is more). A job held by a scope counts as held back over a report when it was
+    throttled in at least half the periods it ran in. Pressroom never ends a job itself.
+26. A `run` started inside a running job is part of that job. It knows it is inside one
+    from `PRESSROOM_JOB` and `PRESSROOM_JOB_PID` (the outer `run`), which a `run` sets
+    only when its daemon knows this rule, since an older one would queue the inner run
+    behind the job it is part of. It is admitted at once, charged nothing, given at most
+    the outer job's threads, and gets its own lane and leases as usual. It holds nothing
+    itself; the outer job's hold holds it. So a whole tool run, `pressroom run -- codex
+    exec …`, is one job: the builds the tool starts through pressroom inside it neither
+    wait for the machine nor take more of it. If the outer job ends first, the daemon
+    makes each run inside it a job of its own at that moment, charged, holding a device
+    slot if it asked for one; its `run` sees the outer `run` gone within a twentieth of a
+    second and holds it from then on by stopping. A `PRESSROOM_JOB` that names no running
+    job is ignored.
 27. A job that runs an Android emulator or an iOS or visionOS simulator says so with
     `--device`. Only `device_slots` such jobs run at once, one by default; the next waits,
     and says which job holds the slot. The device's own processes count as the job's
     where they are its descendants (an emulator), and as outside load (rule 2) where the
     system starts them (a simulator).
-28. If a `run` ends without saying how its job ended (it was killed), the daemon continues
-    every process that `run` last reported, so nothing is left stopped. If the job was
+28. A `run` tells the daemon how it holds its job as soon as the command starts, and,
+    before it stops anything it has not told of, every process group of the job and the
+    job's processes outside them. If a `run` ends without saying how its job ended (it
+    was killed), the daemon continues all of those, so nothing is left stopped. If the job was
     stopped at that moment, the system also sends its process group `SIGHUP` and then
     `SIGCONT`, as it does any stopped group left without its parent: most programs end on
     the first. A job that was running at that moment goes on, no longer held.
@@ -210,7 +222,7 @@ One JSON object per line. The first line from the client names an `op`.
 
 | `op` | Client sends | Daemon answers |
 |---|---|---|
-| `run` | `holder`, `label`, `class`, `threads`, `memoryGb`, `pid`, optional `lane` (`repo`, `toolchain`), `leases` (paths), `leaseKind`, `device` (true for rule 27), `within` (the outer job, rule 26) | Zero or more `{"state":"waiting","reason","ahead"}`, then `{"state":"admitted","job","threads","lanePath","leases","cap","capMemoryGb","within"}`, or `{"state":"refused","reason"}`. `cap` is `hold` or `measure`; `within` is the outer job or null. The job lasts while the connection is open. While it runs the client sends `{"op":"use","threads","memoryGb","held","heldSecs","means","pgid","pids"}` every two seconds and `{"op":"event","event","text"}` for rule 25, and ends it with `{"op":"done","exit","missing","heldSecs"}`. |
+| `run` | `holder`, `label`, `class`, `threads`, `memoryGb`, `pid`, optional `lane` (`repo`, `toolchain`), `leases` (paths), `leaseKind`, `device` (true for rule 27), `within` (the outer job, rule 26) | Zero or more `{"state":"waiting","reason","ahead"}`, then `{"state":"admitted","job","threads","lanePath","leases","cap","capMemoryGb","within"}`, or `{"state":"refused","reason"}`. `cap` is `hold` or `measure`; `within` is the outer job or null. The job lasts while the connection is open. While it runs the client sends `{"op":"use","means","pgid","groups","pids"}` when the command starts and before a stop (rule 28), the same with `"threads","memoryGb","held","heldSecs"` every two seconds (rule 24), and `{"op":"event","event","text"}` for rule 25. It ends the job with `{"op":"done","exit","missing","heldSecs","means"}`. |
 | `status` | | The machine, what is running, what waits and why, live leases |
 | `lease` | `holder`, `kind`, `mode`, `paths`, `ttlSecs`, optional `pid` | `{"ok":true,"id","expires"}` |
 | `release` | `id` | `{"ok":true,"existed"}` |
@@ -282,6 +294,12 @@ replaced by a default. A connection that sends nothing for ten seconds is closed
   `CMAKE_BUILD_PARALLEL_LEVEL`, and batch work runs at lower priority. A tool that starts
   sixteen threads on a grant of two is held to two and runs slower than if it had started
   two. Xcode needs `-jobs "$PRESSROOM_THREADS"`.
+- **What a job leaves running after its command ends is no longer held,** except in a
+  Linux scope, which lasts as long as anything in it: `run` returns when the command
+  does, as before. A run inside the job is the exception (rule 26).
+- **Past 8,192 processes a job is held by its process groups only.** Processes beyond
+  that are stopped with their groups but not measured, and a group first made by one of
+  them is not found. The job is told.
 - **Memory is held on Linux only.** On macOS a job above its memory is charged and
   flagged (rule 24), not stopped.
 - **Rule 18 cannot tell who removed a path.** A job that removes what it leased and then
