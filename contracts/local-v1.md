@@ -35,6 +35,9 @@ Everything is under `$PRESSROOM_HOME`, else `~/.pressroom`, readable by its user
 | `disk_floor_gb` | `20` | Nothing new starts below this much free disk |
 | `grace_hours` | `24` | A path changed more recently than this is not removable |
 | `managed` | | A further folder a cleanup tool may touch. Repeatable. |
+| `cap` | `hold` | `hold`: a running job is held to its grant by the best means here (rule 23). `stop`: held by stopping, even where a scope would work. `measure`: its use is measured and charged (rule 24), not held. |
+| `cap_memory` | `offer` | The memory a job may not pass where memory can be held (rule 23): `offer`, all the memory offered, so the reserve is never taken; or `grant`, what the job asked for. |
+| `device_slots` | `1` | How many jobs that run an emulator or simulator (`--device`, rule 27) may run at once. `0` refuses them. |
 | `galley`, `galley_credential`, `galley_sender` | | Where and how to send the report to Galley. All three or none (`report-v1.md`). |
 
 A `#` starts a comment at the start of a line or after a space. The daemon reads
@@ -128,6 +131,57 @@ A tool that is about to remove something uses `delete-begin`.
     the new daemon did not admit it, so it counts as outside load (rule 2) until it ends,
     and its leases, which are files, still stand.
 
+**Holding a job to its grant.** Added 2026-11-16, after a night when six admitted jobs
+holding 12 threads between them put a laptop's load average at 385.
+
+23. A running job is held to the threads it was granted, by one of two means:
+    - **On Linux, where the cpu controller is delegated to the user** (`systemd-run --user
+      --scope` works), the command runs in a transient scope with a `CPUQuota` of its
+      threads times 100% and a `MemoryMax` of the memory cap (`cap_memory`). The kernel
+      holds everything in the scope, whatever it starts, `nohup` and double forks
+      included.
+    - **Elsewhere (macOS, and Linux without delegation),** `run` measures the processor
+      its job uses twenty times a second. Once the job has used more than its grant, with
+      a fifth of a second's worth to spare, `run` stops its processes (`SIGSTOP`) until
+      the grant has caught up, then continues them (`SIGCONT`). Over any second the job
+      averages no more than its grant. Memory is measured, not held.
+
+    The job's processes are the command, which runs in a process group of its own; every
+    descendant of it; everything in the process group of any of those, since only the
+    job's own processes make such groups (a tool that runs each command in a group of its
+    own, as Codex does, and a daemon that forks twice inside it, are found this way); and
+    every process `run` has seen, even after its parent has gone. With `cap = measure` a
+    job is measured and charged but not held.
+24. The daemon charges each running job the larger of its grant and what it was last
+    measured to use, in threads (rounded) and in memory, when it admits work (rules 2 and
+    3). `run` measures every two seconds: in a Linux scope, from the scope's own counters;
+    elsewhere, by adding up the processor time and memory of the job's processes, with
+    the time of children that have ended. `status` shows use against grant and flags a
+    job that is over: more than a quarter, and at least half a thread, above its
+    threads, or above its memory.
+25. A job is told on its standard error, in one plain line each: when it is first held
+    back (it tried to use more than its grant and now runs slower), when the system ended
+    a process of it for passing the memory cap, and when it cannot be held here and is
+    only measured. The daemon writes the same to `events.log` (`held`, `memory_ended`,
+    `not_held`), and the job's `ended` event says how many seconds it was held back
+    (`heldSecs`). Pressroom never ends a job itself.
+26. A `run` started inside a running job (it sees that job's `PRESSROOM_JOB`) is part of
+    that job. It is admitted at once, charged nothing, given at most the outer job's
+    threads, and gets its own lane and leases as usual. It sets up no hold of its own; the
+    outer job's holds it. So a whole tool run, `pressroom run -- codex exec …`, is one
+    job: the builds the tool starts through pressroom inside it neither wait for the
+    machine nor take more of it. A `PRESSROOM_JOB` that names no running job is ignored.
+27. A job that runs an Android emulator or an iOS or visionOS simulator says so with
+    `--device`. Only `device_slots` such jobs run at once, one by default; the next waits,
+    and says which job holds the slot. The device's own processes count as the job's
+    where they are its descendants (an emulator), and as outside load (rule 2) where the
+    system starts them (a simulator).
+28. If a `run` ends without saying how its job ended (it was killed), the daemon continues
+    every process that `run` last reported, so nothing is left stopped. If the job was
+    stopped at that moment, the system also sends its process group `SIGHUP` and then
+    `SIGCONT`, as it does any stopped group left without its parent: most programs end on
+    the first. A job that was running at that moment goes on, no longer held.
+
 ## Lease file
 
 ```json
@@ -156,7 +210,7 @@ One JSON object per line. The first line from the client names an `op`.
 
 | `op` | Client sends | Daemon answers |
 |---|---|---|
-| `run` | `holder`, `label`, `class`, `threads`, `memoryGb`, `pid`, optional `lane` (`repo`, `toolchain`), `leases` (paths), `leaseKind` | Zero or more `{"state":"waiting","reason","ahead"}`, then `{"state":"admitted","job","threads","lanePath","leases"}`, or `{"state":"refused","reason"}`. The job lasts while the connection is open. The client ends it with `{"op":"done","exit","missing"}`. |
+| `run` | `holder`, `label`, `class`, `threads`, `memoryGb`, `pid`, optional `lane` (`repo`, `toolchain`), `leases` (paths), `leaseKind`, `device` (true for rule 27), `within` (the outer job, rule 26) | Zero or more `{"state":"waiting","reason","ahead"}`, then `{"state":"admitted","job","threads","lanePath","leases","cap","capMemoryGb","within"}`, or `{"state":"refused","reason"}`. `cap` is `hold` or `measure`; `within` is the outer job or null. The job lasts while the connection is open. While it runs the client sends `{"op":"use","threads","memoryGb","held","heldSecs","means","pgid","pids"}` every two seconds and `{"op":"event","event","text"}` for rule 25, and ends it with `{"op":"done","exit","missing","heldSecs"}`. |
 | `status` | | The machine, what is running, what waits and why, live leases |
 | `lease` | `holder`, `kind`, `mode`, `paths`, `ttlSecs`, optional `pid` | `{"ok":true,"id","expires"}` |
 | `release` | `id` | `{"ok":true,"existed"}` |
@@ -182,7 +236,8 @@ One object. Numbers in GB may have fractions; seconds are whole.
 | `diskFreeGb`, `diskFloorGb` | Free disk and the floor below which nothing new starts |
 | `toolchains` | `[{"name","version"}]`, for `rustc`, `cargo`, `bun`, `node` and `xcode`: the first copy that answers, on the daemon's PATH, then in `/opt/homebrew/bin`, `/usr/local/bin`, and under the home folder `.local/bin`, `.cargo/bin`, `.local/share/mise/shims`, `.bun/bin`, and the newest `.rustup/toolchains/*/bin` and `.nvm/versions/node/*/bin` |
 | `managed` | The managed folders |
-| `running` | `[{"job","holder","label","class","threads","memoryGb","lane","pid","forSecs"}]`; `lane` and `pid` may be null |
+| `running` | `[{"job","holder","label","class","threads","memoryGb","lane","pid","forSecs","useThreads","useMemoryGb","over","held","heldSecs","means","device","within"}]`; `lane`, `pid`, `useThreads`, `useMemoryGb`, `means` and `within` may be null. `useThreads` and `useMemoryGb` are what it was last measured to use (rule 24); `over` flags it; `held` is whether it was being held back at the last measure; `means` is how it is held: `scope`, `stop`, `measure` (measured only), or `within` (by its outer job) |
+| `cap`, `deviceSlots`, `devicesInUse` | The `cap` setting, and the device slots (rule 27) and how many are taken |
 | `waiting` | `[{"holder","label","class","threads","reason","forSecs"}]`, in the order they will be admitted |
 | `leases` | Live leases, each as its lease file |
 | `unreadableLeases` | Names of lease files that cannot be read |
@@ -208,14 +263,32 @@ replaced by a default. A connection that sends nothing for ten seconds is closed
 - **It cannot stop work started outside it.** It counts that load against the machine
   (rule 2) and shows it in `status`, with the programs using the most processor, so its
   own work backs off when the machine is full.
-- **It does not cap a running job.** It tells the job how many threads to use through
+- **A hold covers the job's own processes only** (rule 23). In a Linux scope, what the
+  job has someone else start escapes it: a service started through systemd or D-Bus
+  (including another `systemd-run --user`), a container run by a system daemon such as
+  Docker's, and work handed to a server that was already running (a Gradle or Bazel
+  daemon started earlier or by another job, a tool's own background server). On macOS,
+  and on Linux without delegation, so does a process that starts a session or group of
+  its own (`setsid`) and whose parent ends before `run` has seen it, within a twentieth
+  of a second; a process of another user (`sudo`); and anything launchd starts for the
+  job: the iOS simulator runs under launchd, so it is outside load, not the job's. What
+  escapes is counted as outside load (rule 2), not charged to the job.
+- **Stopping is coarse.** A job held by stopping runs in bursts of a twentieth of a second
+  or so and then waits, and one held by a scope is throttled in tenths of a second. A test
+  that measures time can fail under its hold, as it would on a busy machine. Ask for the
+  threads a suite really uses.
+- **The thread count is still a hint to the tools.** The job is told it through
   `PRESSROOM_THREADS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `MAKEFLAGS` and
-  `CMAKE_BUILD_PARALLEL_LEVEL`, and lowers the priority of batch work. A command that
-  ignores these uses what it likes. Xcode needs `-jobs "$PRESSROOM_THREADS"`.
+  `CMAKE_BUILD_PARALLEL_LEVEL`, and batch work runs at lower priority. A tool that starts
+  sixteen threads on a grant of two is held to two and runs slower than if it had started
+  two. Xcode needs `-jobs "$PRESSROOM_THREADS"`.
+- **Memory is held on Linux only.** On macOS a job above its memory is charged and
+  flagged (rule 24), not stopped.
 - **Rule 18 cannot tell who removed a path.** A job that removes what it leased and then
   fails is also reported as a fault of the machine.
 - **A `run` that is killed outright frees its place at once,** even if the command it
-  started is still going.
+  started is still going. In a Linux scope that command is still held; elsewhere it goes
+  on unheld, or, if it was stopped at that moment, the system hangs it up (rule 28).
 - **Holders are labels.** Anything running as the daemon's user can use the socket, and
   the process a job names is taken on trust beyond being alive. That includes
   `person-says`: an agent running as the person's user could say `give`. The events log
@@ -225,5 +298,7 @@ replaced by a default. A connection that sends nothing for ten seconds is closed
   machine is.
 - **The grace time looks at the path itself,** not at everything inside it.
 - **Many idle connections can use up the daemon's file handles** for up to ten seconds.
-- **Linux is untested.** Everything so far ran on macOS.
+- **Linux is tested on two machines only,** both with the cpu controller delegated.
+  Holding by stopping is tested on Linux with `cap` forced to it, not on a machine without
+  delegation.
 - No power, no energy figure, no data classes. The report to Galley is `report-v1.md`.
