@@ -1,7 +1,8 @@
 #!/bin/sh
-# Build Pressroom.app from the Swift package: release build, Info.plist, ad-hoc signature.
+# Build Pressroom.app from the Swift package: release build, Info.plist, signature.
 # Usage: scripts/bundle.sh [output folder, default build]. Start it through pressroom:
 #   pressroom run --threads 4 --memory-gb 4 --lane pressroom-menubar -- scripts/bundle.sh
+# Signing: scripts/sign.sh, as LUFF LLC's Developer ID when this Mac has it, else ad hoc.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 out=${1:-"$here/build"}
@@ -14,5 +15,5 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp "$bin" "$app/Contents/MacOS/PressroomMenuBar"
 cp Resources/Info.plist "$app/Contents/Info.plist"
-codesign --force --sign - --timestamp=none "$app"
+"$here/scripts/sign.sh" "$app"
 echo "$app"
