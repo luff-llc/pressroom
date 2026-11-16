@@ -661,6 +661,7 @@ fn bad_requests_are_refused_in_words() {
         r#"{"op":"run","leases":"/x"}"#,
         r#"{"op":"run","pid":999999999}"#,
         r#"{"op":"run","threads":1,"threads":2}"#,
+        r#"{"op":"run","holder":["agent:a"]}"#,
         r#"{"op":"nonsense"}"#,
         "not json",
     ] {
@@ -935,6 +936,7 @@ fn the_person_can_hold_the_machine_and_give_it_back() {
         r#"{"op":"person-says","mode":"hold","forSecs":"600"}"#,
         r#"{"op":"person-says","mode":"give","forSecs":99999999}"#,
         r#"{"op":"person-says","mode":"auto","forSecs":600}"#,
+        r#"{"op":"person-says","mode":"hold","forSecs":600,"holder":7}"#,
     ] {
         let reply = first_line(raw(&m, bad));
         assert!(reply.contains("\"state\":\"refused\""), "{bad} -> {reply}");

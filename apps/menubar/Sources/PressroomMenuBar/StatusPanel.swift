@@ -35,7 +35,7 @@ struct NotRunningView: View {
         VStack(alignment: .leading, spacing: 6) {
             Label("The Pressroom daemon is not running", systemImage: "square.stack.3d.up.slash")
                 .font(.headline)
-            Text("Nothing started through pressroom runs until it is back. Start it with:")
+            Text("Nothing new starts through pressroom until it is back; work it already started carries on. Start it with:")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Text("pressroom daemon")

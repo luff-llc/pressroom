@@ -8,8 +8,9 @@ public struct DaemonSocket: Sendable {
     public let path: String
     public let timeout: Duration
 
-    /// The most a reply may weigh. `status` with many leases is the largest.
-    static let maxReply = 4 << 20
+    /// The most a reply may weigh: far above any real `status`, which grows with leases,
+    /// but bounded so a broken daemon cannot fill memory.
+    static let maxReply = 64 << 20
 
     public init(path: String, timeout: Duration = .seconds(3)) {
         self.path = path
@@ -110,12 +111,10 @@ public struct DaemonSocket: Sendable {
             }
             if count == 0 { throw PressroomError.closed }
             let chunk = buffer[0..<count]
-            if let newline = chunk.firstIndex(of: 0x0A) {
-                reply.append(contentsOf: chunk[..<newline])
-                return reply
-            }
-            reply.append(contentsOf: chunk)
+            let newline = chunk.firstIndex(of: 0x0A)
+            reply.append(contentsOf: chunk[..<(newline ?? chunk.endIndex)])
             if reply.count > maxReply { throw PressroomError.badReply("reply too long") }
+            if newline != nil { return reply }
         }
     }
 }

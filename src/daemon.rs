@@ -343,7 +343,12 @@ fn reply_to(stream: &mut UnixStream, reply: Result<Value, String>) -> Result<(),
 }
 
 fn text(request: &Value, key: &str, default: &str, max: usize) -> Result<String, String> {
-    let value = request.str(key).unwrap_or(default);
+    // A field of the wrong type is refused, never replaced by the default.
+    let value = match request.get(key) {
+        None | Some(Value::Null) => default,
+        Some(Value::Str(value)) => value.as_str(),
+        _ => return Err(format!("{key} must be text")),
+    };
     if value.is_empty() || value.len() > max || value.chars().any(|c| c.is_control()) {
         return Err(format!("{key} must be 1 to {max} printable characters"));
     }
@@ -889,16 +894,29 @@ fn person_says(shared: &Arc<Shared>, request: &Value) -> Result<Value, String> {
     };
     let at = now();
     let until = at + secs;
-    {
+    let lapsed = {
         let mut state = shared.lock();
+        // What was said before may have ended since the last tick: record that first.
+        let lapsed = match &state.person {
+            Some(p) if state.said(at) == Said::Nothing => Some(p.clone()),
+            _ => None,
+        };
         state.person = (said != Said::Nothing).then(|| PersonSays {
             said,
             since: at,
             until,
             holder: holder.clone(),
         });
-    }
+        lapsed
+    };
     shared.changed.notify_all();
+    if let Some(p) = lapsed {
+        shared.event(vec![
+            ("event", s("person_says_ended")),
+            ("mode", s(p.said.name())),
+            ("holder", s(&p.holder)),
+        ]);
+    }
     shared.event(vec![
         ("event", s("person_says")),
         ("mode", s(said.name())),

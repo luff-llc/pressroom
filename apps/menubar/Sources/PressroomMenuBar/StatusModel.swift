@@ -23,6 +23,10 @@ final class StatusModel {
     private let holder: String
     private let every: Duration
     private var loop: Task<Void, Never>?
+    /// Each refresh takes a ticket; an answer older than one already shown is dropped, so a
+    /// slow poll cannot overwrite what the person just said.
+    private var nextTicket = 0
+    private var shownTicket = -1
 
     init(client: PressroomClient, holder: String, every: Duration = .seconds(3)) {
         self.client = client
@@ -42,16 +46,20 @@ final class StatusModel {
     }
 
     func refresh() async {
+        let ticket = nextTicket
+        nextTicket += 1
+        let next: Phase
         do {
-            phase = .live(try await client.status())
-            updated = .now
+            next = .live(try await client.status())
         } catch PressroomError.notRunning {
-            phase = .notRunning
-            updated = .now
+            next = .notRunning
         } catch {
-            phase = .failed(error.localizedDescription)
-            updated = .now
+            next = .failed(error.localizedDescription)
         }
+        guard ticket > shownTicket else { return }
+        shownTicket = ticket
+        phase = next
+        updated = .now
     }
 
     func say(_ mode: PersonMode, for duration: Duration? = nil) async {
