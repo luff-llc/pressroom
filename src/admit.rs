@@ -54,6 +54,8 @@ pub struct Limits {
     pub disk_floor: u64,
     /// Seconds without input after which the person counts as away.
     pub away_after_secs: u64,
+    /// How many jobs that run an emulator or simulator may run at once (rule 27).
+    pub device_slots: u32,
 }
 
 /// What was measured.
@@ -160,6 +162,8 @@ pub struct Request {
     pub class: Class,
     pub threads: u32,
     pub memory: u64,
+    /// It runs an emulator or simulator and needs the device slot (rule 27).
+    pub device: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,11 +176,41 @@ pub enum Decision {
     Refuse { reason: String },
 }
 
-/// Threads and memory already admitted.
+/// Threads and memory charged to running work: for each job the larger of what it was
+/// granted and what it was last measured to use (rule 24). And the device slots taken.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InUse {
     pub threads: u32,
     pub memory: u64,
+    pub devices: u32,
+}
+
+/// What one running job is charged (rule 24): the larger of its grant and its measured
+/// use, threads rounded to the nearest whole one.
+pub fn charge(granted_threads: u32, granted_memory: u64, used: Option<(f64, u64)>) -> (u32, u64) {
+    match used {
+        Some((threads, memory)) => (
+            granted_threads.max(threads.max(0.0).round().min(4096.0) as u32),
+            granted_memory.max(memory),
+        ),
+        None => (granted_threads, granted_memory),
+    }
+}
+
+/// Whether a job is over its grant (rule 24): more than a quarter, and at least half a
+/// thread, above its threads; or above its memory.
+pub fn over(granted_threads: u32, granted_memory: u64, used: Option<(f64, u64)>) -> bool {
+    let Some((threads, memory)) = used else {
+        return false;
+    };
+    let margin = (granted_threads as f64 * 0.25).max(0.5);
+    threads > granted_threads as f64 + margin || memory > granted_memory
+}
+
+/// Whether a waiting request can be admitted only once a device slot frees. Such a request
+/// does not hold up the line behind it (rule 27).
+pub fn waits_for_device(limits: &Limits, in_use: InUse, request: &Request) -> bool {
+    request.device && limits.device_slots > 0 && in_use.devices >= limits.device_slots
 }
 
 /// Load on the machine that pressroom did not admit: a build someone started outside it,
@@ -227,9 +261,22 @@ pub fn decide(
             ),
         };
     }
+    if request.device && limits.device_slots == 0 {
+        return Decision::Refuse {
+            reason: "this machine runs no emulators or simulators (device_slots = 0)".into(),
+        };
+    }
     if said == Said::Hold {
         return Decision::Wait {
             reason: "its person has asked for the whole machine".into(),
+        };
+    }
+    if waits_for_device(limits, in_use, request) {
+        return Decision::Wait {
+            reason: format!(
+                "the machine's device slot{} taken; one emulator or simulator at a time",
+                if limits.device_slots == 1 { " is" } else { "s are all" }
+            ),
         };
     }
     if ahead > 0 {
@@ -327,6 +374,7 @@ mod tests {
             memory_reserve: 16 * GB,
             disk_floor: 20 * GB,
             away_after_secs: 300,
+            device_slots: 1,
         }
     }
     fn macbook(idle: Option<u64>, load1: f64) -> Measured {
@@ -345,6 +393,7 @@ mod tests {
             class,
             threads,
             memory: gb * GB,
+            device: false,
         }
     }
 
@@ -370,6 +419,51 @@ mod tests {
             budget(&l, &macbook(Some(10), 0.0), Said::Nothing).memory,
             48 * GB
         );
+    }
+
+    #[test]
+    fn one_device_at_a_time() {
+        let l = limits(Kind::Worker);
+        let m = macbook(Some(900), 0.0);
+        let mut emulator = req(0, Class::Waiting, 2, 4);
+        emulator.device = true;
+        let free = InUse::default();
+        assert_eq!(
+            decide(&l, &m, Said::Nothing, free, &emulator, 0),
+            Decision::Admit { threads: 2 }
+        );
+        let taken = InUse {
+            devices: 1,
+            ..free
+        };
+        assert!(matches!(
+            decide(&l, &m, Said::Nothing, taken, &emulator, 0),
+            Decision::Wait { reason } if reason.contains("device slot")
+        ));
+        // Work that needs no device is not held up by it.
+        assert!(waits_for_device(&l, taken, &emulator));
+        assert!(!waits_for_device(&l, taken, &req(1, Class::Batch, 2, 4)));
+        let none = Limits {
+            device_slots: 0,
+            ..l
+        };
+        assert!(matches!(
+            decide(&none, &m, Said::Nothing, free, &emulator, 0),
+            Decision::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn a_job_is_charged_what_it_uses_when_that_is_more() {
+        assert_eq!(charge(2, 2 * GB, None), (2, 2 * GB));
+        assert_eq!(charge(2, 2 * GB, Some((0.3, GB))), (2, 2 * GB));
+        assert_eq!(charge(2, 2 * GB, Some((7.6, 5 * GB))), (8, 5 * GB));
+        assert!(!over(2, 2 * GB, None));
+        assert!(!over(2, 2 * GB, Some((2.5, GB))));
+        assert!(over(2, 2 * GB, Some((2.6, GB))));
+        assert!(over(8, 2 * GB, Some((10.1, GB))));
+        assert!(!over(8, 2 * GB, Some((10.0, GB))));
+        assert!(over(2, 2 * GB, Some((1.0, 3 * GB))));
     }
 
     #[test]
@@ -420,6 +514,7 @@ mod tests {
         let used = InUse {
             threads: 4,
             memory: 4 * GB,
+            ..Default::default()
         };
         assert_eq!(
             decide(&l, &m, Said::Nothing, used, &req(1, Class::Batch, 4, 4), 0),
@@ -428,6 +523,7 @@ mod tests {
         let used = InUse {
             threads: 8,
             memory: 8 * GB,
+            ..Default::default()
         };
         assert!(matches!(
             decide(&l, &m, Said::Nothing, used, &req(2, Class::Batch, 1, 1), 0),
@@ -442,6 +538,7 @@ mod tests {
         let used = InUse {
             threads: 4,
             memory: GB,
+            ..Default::default()
         };
         assert_eq!(
             decide(&l, &m, Said::Nothing, used, &req(1, Class::Batch, 8, 1), 0),
@@ -450,6 +547,7 @@ mod tests {
         let used = InUse {
             threads: 5,
             memory: GB,
+            ..Default::default()
         };
         assert!(matches!(
             decide(&l, &m, Said::Nothing, used, &req(1, Class::Batch, 8, 1), 0),
@@ -494,7 +592,8 @@ mod tests {
                 Said::Nothing,
                 InUse {
                     threads: 2,
-                    memory: GB
+                    memory: GB,
+                    ..Default::default()
                 },
                 &req(0, Class::Waiting, 2, 1),
                 0
@@ -540,6 +639,7 @@ mod tests {
         let used = InUse {
             threads: 4,
             memory: GB,
+            ..Default::default()
         };
         assert_eq!(outside_load(&macbook(Some(10), 4.4), used), 0);
         assert_eq!(outside_load(&macbook(Some(10), 9.0), used), 5);
@@ -563,6 +663,7 @@ mod tests {
         let used = InUse {
             threads: 2,
             memory: 40 * GB,
+            ..Default::default()
         };
         assert!(matches!(
             decide(&l, &m, Said::Nothing, used, &req(1, Class::Batch, 2, 10), 0),

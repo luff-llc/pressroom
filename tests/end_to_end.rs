@@ -58,7 +58,9 @@ impl Machine {
         let mut c = Command::new(BIN);
         c.args(args)
             .env("PRESSROOM_HOME", &self.home)
-            .env("PRESSROOM_HOLDER", "agent:test");
+            .env("PRESSROOM_HOLDER", "agent:test")
+            // These tests may themselves run as a pressroom job; theirs are not part of it.
+            .env_remove("PRESSROOM_JOB");
         c
     }
     fn cmd(&self, args: &[&str]) -> Output {
@@ -1005,4 +1007,328 @@ fn the_person_can_hold_the_machine_and_give_it_back() {
         3,
         "{events}"
     );
+}
+
+/// A shell script that runs `n` busy loops for about `secs` seconds of wall time, then
+/// prints the processor seconds its children used, from the shell's `times`.
+fn spinner(n: u32, secs: u32) -> String {
+    format!(
+        "pids=; i=0; while [ $i -lt {n} ]; do (while :; do :; done) & pids=\"$pids $!\"; i=$((i+1)); done; \
+         sleep {secs}; kill $pids; wait 2>/dev/null; times"
+    )
+}
+
+/// Processor seconds of the children, from the second line of `times`: `0m31.52s 0m0.10s`.
+fn children_cpu(stdout: &str) -> f64 {
+    let line = stdout.lines().last().unwrap_or("");
+    line.split_whitespace()
+        .map(|part| {
+            let (m, s) = part.trim_end_matches('s').split_once('m').unwrap_or(("0", "0"));
+            m.parse::<f64>().unwrap_or(0.0) * 60.0 + s.parse::<f64>().unwrap_or(0.0)
+        })
+        .sum()
+}
+
+/// Run a job asking for one thread that spins eight, and say how many threads' worth of
+/// processor it used over its life, what it was told, and what the log says.
+fn spin_eight_on_one(m: &Machine) -> (f64, String, String) {
+    let started = Instant::now();
+    let out = m.cmd(&["run", "--threads", "1", "--class", "waiting", "--", "sh", "-c", &spinner(8, 4)]);
+    let wall = started.elapsed().as_secs_f64();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let cpu = children_cpu(&text(&out.stdout));
+    assert!(cpu > 0.5, "the spinner did not spin: {}", text(&out.stdout));
+    let events = fs::read_to_string(m.home.join("events.log")).unwrap();
+    (cpu / wall, text(&out.stderr), events)
+}
+
+#[test]
+fn a_job_asking_for_one_thread_and_spinning_eight_is_held_to_one() {
+    // By the best means here: a systemd scope on Linux where the cpu controller is
+    // delegated, else by stopping and continuing it.
+    let m = Machine::start("hold", WORKER);
+    let (threads, stderr, events) = spin_eight_on_one(&m);
+    assert!(threads < 1.5, "used {threads:.2} threads on a grant of 1\n{stderr}");
+    assert!(stderr.contains("held to 1 and runs slower"), "{stderr}");
+    assert!(events.contains("\"event\":\"held\""), "{events}");
+    let ended = events.lines().find(|l| l.contains("\"event\":\"ended\"")).unwrap();
+    assert!(!ended.contains("\"heldSecs\":0"), "{ended}");
+    // On Linux, by a scope wherever systemd will make one that holds; elsewhere by stopping.
+    let means = if scope_here() { "scope" } else { "stop" };
+    assert!(ended.contains(&format!("\"means\":\"{means}\"")), "{ended}");
+}
+
+/// Whether `systemd-run --user --scope` makes a scope here with the cpu controller.
+fn scope_here() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let mut probe = Command::new("systemd-run");
+    probe.args([
+        "--user", "--scope", "--quiet", "--expand-environment=no", "-p", "CPUQuota=100%", "--",
+        "/bin/sh", "-c", "cat \"/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/cpu.max\"",
+    ]);
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        let uid = text(&Command::new("id").arg("-u").output().unwrap().stdout);
+        probe.env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
+    }
+    probe
+        .output()
+        .is_ok_and(|out| text(&out.stdout).starts_with("100000 "))
+}
+
+#[test]
+fn held_by_stopping_where_that_is_the_means() {
+    // The means macOS has, forced here so it is tested on Linux too.
+    let m = Machine::start("stop", &format!("{WORKER}cap = stop\n"));
+    let (threads, stderr, _) = spin_eight_on_one(&m);
+    assert!(threads < 1.5, "used {threads:.2} threads on a grant of 1\n{stderr}");
+}
+
+#[test]
+fn use_is_measured_and_shown_against_the_grant() {
+    let m = Machine::start("measure", &format!("{WORKER}cap = measure\n"));
+    let job = m
+        .command(&["run", "--threads", "1", "--label", "greedy", "--", "sh", "-c", &spinner(4, 6)])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Measured, charged and flagged, not held (rule 24).
+    m.wait_for("the job measured over its grant", |s| {
+        s.contains("\"over\":true") && s.contains("\"means\":\"measure\"")
+    });
+    let status = m.status();
+    let used: f64 = status
+        .split("\"useThreads\":")
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}']).next())
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    assert!(used > 2.0, "{status}");
+    let charged: f64 = status
+        .split("\"usedThreads\":")
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}']).next())
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    assert!(charged >= used.round() - 0.01, "charged {charged} for {used}\n{status}");
+    let out = job.wait_with_output().unwrap();
+    assert!(text(&out.stderr).contains("does not hold them"), "{}", text(&out.stderr));
+    let cpu = children_cpu(&text(&out.stdout));
+    assert!(cpu > 8.0, "it was held although cap = measure: {cpu}");
+}
+
+#[test]
+fn a_run_inside_a_job_is_part_of_it() {
+    // The outer job takes every thread offered. A build it starts through pressroom does
+    // not wait for the machine, and gets no more than the outer job has (rule 26).
+    let m = Machine::start("within", ONE_THREAD);
+    let inner = format!(
+        "{BIN} run --threads 8 --label inner --lane demo -- sh -c 'echo inner $PRESSROOM_THREADS; echo $CARGO_TARGET_DIR'"
+    );
+    let out = m
+        .command(&["run", "--threads", "8", "--label", "outer", "--", "sh", "-c", &inner])
+        .env("PRESSROOM_HOME", &m.home)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("inner 1"), "{stdout}");
+    assert!(stdout.contains("/lanes/demo/"), "{stdout}");
+    let events = fs::read_to_string(m.home.join("events.log")).unwrap();
+    let outer = events
+        .lines()
+        .find(|l| l.contains("\"label\":\"outer\""))
+        .and_then(|l| l.split("\"job\":\"").nth(1))
+        .and_then(|rest| rest.split('"').next())
+        .unwrap()
+        .to_string();
+    assert!(
+        events.contains(&format!("\"within\":\"{outer}\"")),
+        "{events}"
+    );
+    // A PRESSROOM_JOB that names no running job is ignored.
+    let out = m
+        .command(&["run", "--", "sh", "-c", "echo $PRESSROOM_THREADS"])
+        .env("PRESSROOM_JOB", "j-1-1")
+        .env("PRESSROOM_JOB_PID", std::process::id().to_string())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn one_emulator_or_simulator_at_a_time() {
+    let m = Machine::start("device", WORKER);
+    let first = m
+        .command(&["run", "--device", "--label", "emulator", "--", "sleep", "3"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    m.wait_for("the emulator running", |s| s.contains("\"devicesInUse\":1"));
+    let second = m
+        .command(&["run", "--device", "--label", "simulator", "--", "true"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    m.wait_for("the simulator waiting for the slot", |s| {
+        s.contains("device slot is taken") && s.contains("(emulator)")
+    });
+    // Work that needs no device does not wait behind it.
+    let out = m.cmd(&["run", "--", "true"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(first.wait_with_output().unwrap().status.success());
+    let out = second.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(text(&out.stderr).contains("device slot"), "{}", text(&out.stderr));
+
+    let none = Machine::start("nodevice", &format!("{WORKER}device_slots = 0\n"));
+    let out = none.cmd(&["run", "--device", "--", "true"]);
+    assert_eq!(out.status.code(), Some(69));
+    assert!(text(&out.stderr).contains("device_slots = 0"));
+}
+
+#[test]
+fn a_killed_run_leaves_nothing_stopped() {
+    let m = Machine::start("killed", &format!("{WORKER}cap = stop\n"));
+    let pids = m.home.join("pids");
+    let script = format!(
+        // They ignore the hang-up the system sends a stopped group left without its parent,
+        // so they must be found running, not stopped.
+        "trap '' HUP; i=0; while [ $i -lt 4 ]; do (while :; do :; done) & echo $! >> {}; i=$((i+1)); done; wait",
+        pids.display()
+    );
+    let mut run = m
+        .command(&["run", "--threads", "1", "--", "sh", "-c", &script])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    m.wait_for("the job held", |s| s.contains("\"held\":true"));
+    run.kill().unwrap();
+    run.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let spinners = fs::read_to_string(&pids).unwrap();
+    let pids: Vec<&str> = spinners.split_whitespace().collect();
+    // Look a few times: none is left stopped (rule 28).
+    for _ in 0..5 {
+        let out = Command::new("ps").args(["-o", "stat=", "-p", &pids.join(",")]).output().unwrap();
+        let states = text(&out.stdout);
+        assert!(!states.is_empty() && !states.contains('T'), "{states}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for pid in pids {
+        let _ = Command::new("kill").arg(pid).status();
+    }
+}
+
+/// Processor seconds from `ps -o time=`: `[[dd-]hh:]mm:ss[.xx]`.
+fn ps_time(text: &str) -> f64 {
+    text.split_whitespace()
+        .map(|t| {
+            let (days, rest) = t.split_once('-').unwrap_or(("0", t));
+            let secs: f64 = rest
+                .split(':')
+                .fold(0.0, |acc, part| acc * 60.0 + part.parse::<f64>().unwrap_or(0.0));
+            days.parse::<f64>().unwrap_or(0.0) * 86400.0 + secs
+        })
+        .sum()
+}
+
+#[test]
+fn a_tool_that_runs_commands_in_groups_of_their_own_is_still_held() {
+    // As Codex does: each command in a process group of its own, and inside it, spinners
+    // that fork twice so their parent is gone at once. They are the job's all the same.
+    if Command::new("perl").arg("-e1").status().map_or(true, |s| !s.success()) {
+        eprintln!("no perl here; skipped");
+        return;
+    }
+    for cap in ["hold", "stop"] {
+        let m = Machine::start(&format!("groups-{cap}"), &format!("{WORKER}cap = {cap}\n"));
+        let pids = m.home.join("pids");
+        let script = format!(
+            r#"setpgrp(0,0); open(my $f, ">", "{0}"); my @p;
+               for (1..4) {{ pipe(my $r, my $w); if (!fork) {{ if (my $k = fork) {{ print $w "$k\n"; exit }} 1 while 1 }}
+                 close $w; my $k = <$r>; chomp $k; push @p, $k; waitpid(-1, 0) }}
+               print $f join(" ", @p); close $f; sleep 5;
+               print `ps -o time= -p @{{[join(",", @p)]}}`; kill "KILL", @p;"#,
+            pids.display()
+        );
+        // The tool is the job's first process; the command runs one level down.
+        let out = m.cmd(&["run", "--threads", "1", "--", "sh", "-c", "perl -e \"$1\"; exit $?", "sh", &script]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let used = ps_time(&text(&out.stdout));
+        // Four spinners for five seconds would be twenty seconds unheld.
+        assert!(used > 0.5 && used < 9.0, "{cap}: the spinners used {used:.1}s in 5s\n{}", text(&out.stdout));
+        assert!(text(&out.stderr).contains("held to 1"), "{cap}: {}", text(&out.stderr));
+    }
+}
+
+#[test]
+fn a_run_left_behind_by_its_job_becomes_a_job_of_its_own() {
+    // The outer command starts a build through pressroom in the background and ends at
+    // once. The build must not go on unheld and uncharged (rule 26).
+    let m = Machine::start("orphan", &format!("{WORKER}cap = stop\n"));
+    let timed = m.home.join("times");
+    let inner = format!(
+        "{BIN} run --threads 1 --label inner -- sh -c '{} > {}' &",
+        spinner(4, 4),
+        timed.display()
+    );
+    let started = Instant::now();
+    let out = m
+        .command(&["run", "--threads", "8", "--label", "outer", "--", "sh", "-c", &inner])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    let times = wait_file(&timed, |t| t.lines().count() >= 2);
+    let wall = started.elapsed().as_secs_f64();
+    let threads = children_cpu(&times) / wall;
+    assert!(stderr.contains("now a job of its own"), "{stderr}");
+    assert!(threads < 1.6, "the left-behind build used {threads:.2} threads on 1\n{stderr}");
+    let events = fs::read_to_string(m.home.join("events.log")).unwrap();
+    assert!(events.contains("\"event\":\"on_its_own\""), "{events}");
+}
+
+#[test]
+fn a_killed_run_leaves_no_group_of_its_job_stopped() {
+    // A second process group whose parent lives is not hung up by the system when `run`
+    // dies; only the daemon continues it (rule 28).
+    if Command::new("perl").arg("-e1").status().map_or(true, |s| !s.success()) {
+        eprintln!("no perl here; skipped");
+        return;
+    }
+    let m = Machine::start("killed2", &format!("{WORKER}cap = stop\n"));
+    let pids = m.home.join("pids");
+    let script = format!(
+        r#"$SIG{{HUP}} = "IGNORE"; setpgrp(0,0); open(my $f, ">", "{0}"); my @p;
+           for (1..3) {{ my $k = fork; if (!$k) {{ 1 while 1 }} push @p, $k }}
+           print $f join(" ", @p, $$); close $f; sleep 60;"#,
+        pids.display()
+    );
+    let mut run = m
+        .command(&["run", "--threads", "1", "--", "sh", "-c", "trap '' HUP; perl -e \"$1\"", "sh", &script])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    m.wait_for("the job held", |s| s.contains("\"held\":true"));
+    run.kill().unwrap();
+    run.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let listed = fs::read_to_string(&pids).unwrap();
+    let pids: Vec<&str> = listed.split_whitespace().collect();
+    let mut states = String::new();
+    for _ in 0..5 {
+        let out = Command::new("ps").args(["-o", "stat=", "-p", &pids.join(",")]).output().unwrap();
+        states = text(&out.stdout);
+        if !states.contains('T') {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for pid in &pids {
+        let _ = Command::new("kill").args(["-9", pid]).status();
+    }
+    assert!(!states.is_empty() && !states.contains('T'), "left stopped: {states}");
 }

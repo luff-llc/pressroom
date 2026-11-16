@@ -60,6 +60,31 @@ pub struct Config {
     pub grace_secs: u64,
     /// Where to send the report (contracts/report-v1.md), if anywhere.
     pub galley: Option<Galley>,
+    /// How a running job is held (rule 23).
+    pub cap: Cap,
+    /// Hold memory at the offer rather than the grant (rule 23, `cap_memory`).
+    pub cap_memory_at_offer: bool,
+}
+
+/// The `cap` setting (rule 23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cap {
+    /// Held by the best means here: a scope where one works, else by stopping.
+    Hold,
+    /// Held by stopping, even where a scope would work.
+    Stop,
+    /// Measured and charged, not held.
+    Measure,
+}
+
+impl Cap {
+    pub fn name(self) -> &'static str {
+        match self {
+            Cap::Hold => "hold",
+            Cap::Stop => "stop",
+            Cap::Measure => "measure",
+        }
+    }
 }
 
 /// The three settings that turn the report on. All three or none.
@@ -106,6 +131,7 @@ pub fn load_config(layout: &Layout, total_memory: u64) -> Result<Config, String>
             memory_reserve: total_memory / 4,
             disk_floor: 20 * GB,
             away_after_secs: 300,
+            device_slots: 1,
         },
         managed: layout
             .built_in_managed()
@@ -114,6 +140,8 @@ pub fn load_config(layout: &Layout, total_memory: u64) -> Result<Config, String>
             .collect(),
         grace_secs: 24 * 3600,
         galley: None,
+        cap: Cap::Hold,
+        cap_memory_at_offer: true,
     };
     let (mut origin, mut credential, mut sender) = (None, None, None);
     let path = layout.config();
@@ -178,6 +206,27 @@ pub fn load_config(layout: &Layout, total_memory: u64) -> Result<Config, String>
             "grace_hours" => {
                 config.grace_secs =
                     (number().ok_or_else(|| bad("expected a number"))? * 3600.0) as u64
+            }
+            "cap" => {
+                config.cap = match value {
+                    "hold" => Cap::Hold,
+                    "stop" => Cap::Stop,
+                    "measure" => Cap::Measure,
+                    _ => return Err(bad("cap is hold, stop or measure")),
+                }
+            }
+            "cap_memory" => {
+                config.cap_memory_at_offer = match value {
+                    "offer" => true,
+                    "grant" => false,
+                    _ => return Err(bad("cap_memory is offer or grant")),
+                }
+            }
+            "device_slots" => {
+                config.limits.device_slots = number()
+                    .filter(|n| n.fract() == 0.0 && *n <= 64.0)
+                    .ok_or_else(|| bad("device_slots is a whole number, 0 to 64"))?
+                    as u32
             }
             "managed" => {
                 let dir = Path::new(value);
@@ -659,7 +708,23 @@ mod tests {
         .unwrap();
         assert!(load_config(&layout, GB).is_ok());
 
+        assert_eq!(c.cap, Cap::Hold);
+        assert!(c.cap_memory_at_offer);
+        assert_eq!(c.limits.device_slots, 1);
+        fs::write(
+            layout.config(),
+            "cap = stop\ncap_memory = grant\ndevice_slots = 0\n",
+        )
+        .unwrap();
+        let c = load_config(&layout, GB).unwrap();
+        assert_eq!(c.cap, Cap::Stop);
+        assert!(!c.cap_memory_at_offer);
+        assert_eq!(c.limits.device_slots, 0);
+
         for bad in [
+            "cap = off",
+            "cap_memory = all",
+            "device_slots = 1.5",
             "galley = https://galley.example.test",
             "galley = https://galley.example.test\ngalley_credential = /a/b",
             "galley_sender = /c/d",

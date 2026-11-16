@@ -36,6 +36,13 @@ with the thread count it was given (`CARGO_BUILD_JOBS` and the like), in a build
 of its own (`CARGO_TARGET_DIR`), holding a lease on that folder and on anything named
 with `--lease`. `pressroom help` lists everything.
 
+The job is held to the threads it was given, whatever it starts: on Linux in a systemd
+scope with a processor quota, on macOS by stopping and continuing it when it runs ahead
+of its grant. `status` shows what each job really uses against what it was given. A
+`pressroom run` inside a job is part of that job, so `pressroom run -- codex exec ...` is
+one job however many builds the tool starts. A job that runs an emulator or simulator
+says `--device`; one runs at a time. Rules 23 to 28 of the contract.
+
 For a cleanup tool:
 
 ```sh
@@ -72,7 +79,8 @@ client of the socket only. See [apps/menubar/README.md](apps/menubar/README.md).
 ## Limits
 
 Read "What version 1 does not do" in the contract. The main one: it governs only what is
-started through it.
+started through it, and a job's hold covers only its own processes, not work it hands to
+a server that was already running.
 
 ## Build
 

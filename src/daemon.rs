@@ -41,10 +41,38 @@ struct Job {
     pid: Option<u32>,
     started: u64,
     lease_ids: Vec<String>,
+    /// It holds a device slot (rule 27).
+    device: bool,
+    /// It asked for one; inside a job that holds one it shares that job's (rule 26).
+    asked_device: bool,
+    /// The job it runs inside (rule 26); charged nothing of its own.
+    within: Option<String>,
+    /// What `run` last measured it to use: threads and bytes (rule 24).
+    used: Option<(f64, u64)>,
+    held: bool,
+    held_secs: f64,
+    /// How `run` holds it: `scope`, `stop` or `measure`; `within` for rule 26.
+    means: Option<String>,
+    /// Its process groups and loose processes, to continue if its `run` dies (rule 28).
+    pgid: Option<i32>,
+    groups: Vec<i32>,
+    pids: Vec<i32>,
+}
+
+impl Job {
+    /// What it is charged for admission (rule 24).
+    fn charge(&self) -> (u32, u64) {
+        if self.within.is_some() {
+            return (0, 0);
+        }
+        admit::charge(self.threads, self.memory, self.used)
+    }
 }
 
 struct Waiter {
     request: Request,
+    /// The job it waits inside (rule 26). While that job runs, it holds up no one.
+    within: Option<String>,
     holder: String,
     label: String,
     since: u64,
@@ -86,8 +114,9 @@ impl State {
 
     fn in_use(&self) -> InUse {
         InUse {
-            threads: self.running.iter().map(|j| j.threads).sum(),
-            memory: self.running.iter().map(|j| j.memory).sum(),
+            threads: self.running.iter().map(|j| j.charge().0).sum(),
+            memory: self.running.iter().map(|j| j.charge().1).sum(),
+            devices: self.running.iter().filter(|j| j.device).count() as u32,
         }
     }
 }
@@ -466,7 +495,17 @@ fn run(
         if kind == "delete" || !lease::KINDS.contains(&kind.as_str()) {
             return Err("unknown lease kind".to_string());
         }
-        Ok((holder, label, class, threads, memory, lane, leased, kind))
+        let device = match request.get("device") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            _ => return Err("device must be true or false".into()),
+        };
+        let within = match request.get("within") {
+            None | Some(Value::Null) => None,
+            Some(Value::Str(job)) if !job.is_empty() && job.len() <= 64 => Some(job.clone()),
+            _ => return Err("within must name a job".into()),
+        };
+        Ok((holder, label, class, threads, memory, lane, leased, kind, device, within))
     })();
     let deny = |stream: &mut UnixStream, holder: &str, reason: String| {
         shared.event(vec![
@@ -476,7 +515,7 @@ fn run(
         ]);
         refuse(stream, reason)
     };
-    let (holder, label, class, threads, memory, lane, leased, lease_kind) = match parsed {
+    let (holder, label, class, threads, memory, lane, leased, lease_kind, device, within) = match parsed {
         Ok(parsed) => parsed,
         Err(reason) => return deny(stream, request.str("holder").unwrap_or("unknown"), reason),
     };
@@ -498,7 +537,9 @@ fn run(
                 class,
                 threads,
                 memory,
+                device,
             },
+            within: within.clone(),
             holder: holder.clone(),
             label: label.clone(),
             since: now(),
@@ -515,22 +556,66 @@ fn run(
     // that has gone away is noticed.
     let admitted = loop {
         let mut state = shared.lock();
-        let requests: Vec<Request> = state.waiting.iter().map(|w| w.request.clone()).collect();
-        let me = Request {
+        let in_use = state.in_use();
+        let limits = state.config.limits.clone();
+        // Work inside a running job, and work that waits only for a device slot, holds up
+        // no one behind it (rules 26 and 27).
+        let requests: Vec<Request> = state
+            .waiting
+            .iter()
+            .filter(|w| {
+                let inside = w
+                    .within
+                    .as_ref()
+                    .is_some_and(|id| state.running.iter().any(|j| &j.id == id));
+                w.request.seq == seq
+                    || !(inside || admit::waits_for_device(&limits, in_use, &w.request))
+            })
+            .map(|w| w.request.clone())
+            .collect();
+        // The job this runs inside, if it still runs (rule 26).
+        let outer = within
+            .as_ref()
+            .and_then(|id| state.running.iter().find(|j| &j.id == id))
+            .map(|j| (j.id.clone(), j.threads, j.device));
+        let mut me = Request {
             seq,
             class,
             threads,
             memory,
+            device,
         };
+        if let Some((_, _, true)) = outer {
+            // It shares its outer job's device slot.
+            me.device = false;
+        }
         let ahead = ahead_of(&requests, seq);
-        let mut decision = admit::decide(
-            &state.config.limits,
-            &state.measured,
-            state.said(now()),
-            state.in_use(),
-            &me,
-            ahead,
-        );
+        let mut decision = match &outer {
+            Some((_, outer_threads, _)) => {
+                if admit::waits_for_device(&limits, in_use, &me) {
+                    admit::decide(&limits, &state.measured, Said::Nothing, in_use, &me, 0)
+                } else {
+                    Decision::Admit {
+                        threads: threads.min(*outer_threads).max(1),
+                    }
+                }
+            }
+            None => admit::decide(
+                &limits,
+                &state.measured,
+                state.said(now()),
+                in_use,
+                &me,
+                ahead,
+            ),
+        };
+        if let Decision::Wait { reason } = &mut decision {
+            if admit::waits_for_device(&limits, in_use, &me) {
+                if let Some(j) = state.running.iter().find(|j| j.device) {
+                    reason.push_str(&format!(": {} ({})", j.id, j.label));
+                }
+            }
+        }
         // Read the leases once per pass; every check below uses this one reading.
         let live = if matches!(decision, Decision::Admit { .. }) {
             shared.store.live(now())
@@ -573,6 +658,8 @@ fn run(
                     &leased,
                     &lease_kind,
                     pid,
+                    (me.device, device),
+                    outer.as_ref().map(|o| o.0.clone()),
                 ) {
                     Ok(job) => job,
                     Err(reason) => {
@@ -608,14 +695,27 @@ fn run(
             }
         }
     };
-    let (job_id, granted, lane_path, lease_ids) = admitted;
+    let (job_id, granted, lane_path, lease_ids, within) = admitted;
     shared.changed.notify_all();
+    let (cap, cap_memory) = {
+        let state = shared.lock();
+        let offer =
+            admit::budget(&state.config.limits, &state.measured, Said::Nothing).memory;
+        let cap_memory = if state.config.cap_memory_at_offer {
+            offer
+        } else {
+            memory
+        };
+        (state.config.cap.name(), cap_memory)
+    };
     shared.event(vec![
         ("event", s("started")),
         ("job", s(&job_id)),
         ("holder", s(&holder)),
         ("label", s(&label)),
         ("threads", n(granted)),
+        ("device", Value::Bool(device)),
+        ("within", within.as_ref().map_or(Value::Null, s)),
     ]);
     let told = send(
         stream,
@@ -630,24 +730,66 @@ fn run(
                     .map_or(Value::Null, |p| s(p.to_string_lossy())),
             ),
             ("leases", json::strs(&lease_ids)),
+            ("cap", s(cap)),
+            ("capMemoryGb", n(cap_memory as f64 / GB as f64)),
+            ("within", within.as_ref().map_or(Value::Null, s)),
         ]),
     );
 
-    // The job runs for as long as the client keeps the connection open. Its last line
-    // says how it ended; a connection that closes without one ended we know not how.
+    // The job runs for as long as the client keeps the connection open. While it runs
+    // the client says what it uses (rule 24) and what it was told (rule 25). Its last
+    // line says how it ended; a connection that closes without one ended we know not how.
     let mut outcome = Value::Null;
     let _ = stream.set_read_timeout(None);
     if told.is_ok() {
         while let Ok(Some(line)) = read_line(reader) {
-            if line.str("op") == Some("done") {
-                outcome = line;
-                break;
+            match line.str("op") {
+                Some("done") => {
+                    outcome = line;
+                    break;
+                }
+                Some("use") => {
+                    let mut state = shared.lock();
+                    if let Some(job) = state.running.iter_mut().find(|j| j.id == job_id) {
+                        took_use(job, &line);
+                    }
+                }
+                Some("event") => {
+                    let event = line.str("event").unwrap_or("");
+                    if ["held", "memory_ended", "not_held", "on_its_own"].contains(&event) {
+                        shared.event(vec![
+                            ("event", s(event)),
+                            ("job", s(&job_id)),
+                            ("holder", s(&holder)),
+                            ("text", clip(line.str("text").unwrap_or(""), 300)),
+                        ]);
+                    }
+                }
+                _ => {}
             }
         }
     }
-    {
+    let ended = {
         let mut state = shared.lock();
-        state.running.retain(|j| j.id != job_id);
+        let at = state.running.iter().position(|j| j.id == job_id);
+        let ended = at.map(|i| state.running.remove(i));
+        // Runs inside this job become jobs of their own, charged and holding a device slot
+        // if they asked for one, under the same lock, so nothing is admitted in their
+        // place meanwhile (rule 26). Their `run`s see this job's `run` gone and hold them.
+        for inner in state
+            .running
+            .iter_mut()
+            .filter(|j| j.within.as_deref() == Some(job_id.as_str()))
+        {
+            inner.within = None;
+            inner.device = inner.asked_device;
+        }
+        ended
+    };
+    if outcome == Value::Null {
+        if let Some(job) = &ended {
+            continue_job(job);
+        }
     }
     for id in &lease_ids {
         shared.store.remove(id);
@@ -663,6 +805,17 @@ fn run(
         Some(Value::Num(code)) => fields.push(("exit", n(*code))),
         _ => fields.push(("exit", Value::Null)),
     }
+    let held_secs = outcome
+        .num("heldSecs")
+        .or(ended.as_ref().map(|j| j.held_secs))
+        .unwrap_or(0.0);
+    fields.push(("heldSecs", n64(held_secs.max(0.0).round() as u64)));
+    let means = outcome
+        .str("means")
+        .filter(|m| ["scope", "stop", "measure"].contains(m))
+        .map(str::to_string)
+        .or(ended.as_ref().and_then(|j| j.means.clone()));
+    fields.push(("means", means.map_or(Value::Null, s)));
     shared.event(fields);
     if !missing.is_empty() {
         // Something leased was removed under the job: the machine's fault, not the code's.
@@ -676,7 +829,72 @@ fn run(
     Ok(())
 }
 
-type Started = (String, u32, Option<PathBuf>, Vec<String>);
+type Started = (String, u32, Option<PathBuf>, Vec<String>, Option<String>);
+
+/// Take what `run` measured its job to use (rule 24). It is the client's word, as its
+/// holder is; anything of the wrong type is left as it was.
+fn took_use(job: &mut Job, line: &Value) {
+    if let (Some(threads), Some(gb)) = (line.num("threads"), line.num("memoryGb")) {
+        if threads.is_finite() && gb.is_finite() && threads >= 0.0 && gb >= 0.0 {
+            job.used = Some((threads.min(4096.0), (gb.min(1.0e6) * GB as f64) as u64));
+        }
+    }
+    if let Some(Value::Bool(held)) = line.get("held") {
+        job.held = *held;
+    }
+    if let Some(secs) = line.num("heldSecs").filter(|s| s.is_finite() && *s >= 0.0) {
+        job.held_secs = secs;
+    }
+    if let Some(means) = line.str("means") {
+        if ["scope", "stop", "measure"].contains(&means) {
+            job.means = Some(means.to_string());
+        }
+    }
+    if let Some(pgid) = line.u64("pgid").and_then(|p| i32::try_from(p).ok()) {
+        job.pgid = Some(pgid);
+    }
+    let ids = |key: &str| -> Option<Vec<i32>> {
+        let Some(Value::Arr(items)) = line.get(key) else {
+            return None;
+        };
+        Some(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Num(p) if p.fract() == 0.0 && *p > 1.0 && *p < i32::MAX as f64 => {
+                        Some(*p as i32)
+                    }
+                    _ => None,
+                })
+                .take(crate::cap::MAX_REPORTED)
+                .collect(),
+        )
+    };
+    if let Some(groups) = ids("groups") {
+        job.groups = groups;
+    }
+    if let Some(pids) = ids("pids") {
+        job.pids = pids;
+    }
+}
+
+/// Its `run` is gone without saying how the job ended: continue whatever it may have left
+/// stopped (rule 28). Never the daemon itself or its own group.
+fn continue_job(job: &Job) {
+    if job.means.as_deref() != Some("stop") {
+        return;
+    }
+    let me = std::process::id() as i32;
+    let my_group = crate::cap::sys::own_group();
+    for &g in job.pgid.iter().chain(&job.groups) {
+        if g > 1 && g != me && g != my_group {
+            crate::cap::sys::kill(-g, crate::cap::sys::SIGCONT);
+        }
+    }
+    for &pid in job.pids.iter().filter(|&&p| p > 1 && p != me) {
+        crate::cap::sys::kill(pid, crate::cap::sys::SIGCONT);
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn start(
@@ -693,6 +911,8 @@ fn start(
     leased: &[PathBuf],
     lease_kind: &str,
     pid: Option<u32>,
+    (device, asked_device): (bool, bool),
+    within: Option<String>,
 ) -> Result<Started, String> {
     let at = now();
     let job_id = format!("j-{at}-{seq}");
@@ -759,8 +979,18 @@ fn start(
         pid,
         started: at,
         lease_ids: lease_ids.clone(),
+        device,
+        asked_device,
+        means: within.as_ref().map(|_| "within".to_string()),
+        within: within.clone(),
+        used: None,
+        held: false,
+        held_secs: 0.0,
+        pgid: None,
+        groups: Vec::new(),
+        pids: Vec::new(),
     });
-    Ok((job_id, threads, lane_path, lease_ids))
+    Ok((job_id, threads, lane_path, lease_ids, within))
 }
 
 fn add_lease(shared: &Arc<Shared>, request: &Value) -> Result<Value, String> {
@@ -981,6 +1211,21 @@ fn status(shared: &Arc<Shared>) -> Value {
                 ),
                 ("pid", j.pid.map_or(Value::Null, n)),
                 ("forSecs", n64(at.saturating_sub(j.started))),
+                (
+                    "useThreads",
+                    j.used.map_or(Value::Null, |u| n((u.0 * 10.0).round() / 10.0)),
+                ),
+                (
+                    "useMemoryGb",
+                    j.used
+                        .map_or(Value::Null, |u| n((u.1 as f64 / GB as f64 * 10.0).round() / 10.0)),
+                ),
+                ("over", Value::Bool(admit::over(j.threads, j.memory, j.used))),
+                ("held", Value::Bool(j.held)),
+                ("heldSecs", n64(j.held_secs.round() as u64)),
+                ("means", j.means.as_ref().map_or(Value::Null, s)),
+                ("device", Value::Bool(j.device)),
+                ("within", j.within.as_ref().map_or(Value::Null, s)),
             ])
         })
         .collect();
@@ -1074,6 +1319,9 @@ fn status(shared: &Arc<Shared>) -> Value {
                     .collect(),
             ),
         ),
+        ("cap", s(state.config.cap.name())),
+        ("deviceSlots", n(state.config.limits.device_slots)),
+        ("devicesInUse", n(in_use.devices)),
         ("running", Value::Arr(running)),
         ("waiting", Value::Arr(waiting)),
         ("leases", Value::Arr(leases)),
