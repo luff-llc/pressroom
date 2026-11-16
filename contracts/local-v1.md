@@ -48,7 +48,8 @@ workstation counts its person as present.
 **Admission.**
 
 1. The machine offers a number of threads (its threads times the share that applies,
-   at least one) and an amount of memory (its memory less the reserve).
+   at least one, or none while its person holds it, rule 19) and an amount of memory
+   (its memory less the reserve).
 2. Work is admitted only while what is already admitted, plus load on the machine that
    pressroom did not admit, plus the new work, fits the offer.
 3. Work asking for more threads than the offer is given the offer. Work is given what is
@@ -101,6 +102,19 @@ A tool that is about to remove something uses `delete-begin`.
     the command also failed, `run` exits 75 in place of the command's own code: a fault
     of the machine, not of the code.
 
+**What the person says.** Added 2026-11-15 for the menu bar item (`apps/menubar`).
+
+19. The person can say "I need the whole machine" (`hold`): nothing new is admitted, and
+    work waits with that reason. Work already running goes on; version 1 cannot stop it.
+    Work that could never fit is still refused, not held.
+20. The person can say "take it all, I am away" (`give`): every thread is offered, as if
+    the share were 1, and the person counts as away. The memory reserve still applies.
+21. Either lasts until its end (1 minute to 7 days), until the person says `auto`, or
+    until a new `hold` or `give` replaces it. `give` also ends once the machine sees
+    input more than a minute after it was said: the person is back, and their own use
+    comes first. A restart of the daemon forgets it. Each is written to `events.log`
+    (`person_says`, and `person_says_ended` when it runs out).
+
 ## Lease file
 
 ```json
@@ -135,6 +149,31 @@ One JSON object per line. The first line from the client names an `op`.
 | `release` | `id` | `{"ok":true,"existed"}` |
 | `delete-begin` | `holder`, `paths` (one), `ttlSecs`, optional `pid` | `{"ok":true,"id","expires"}`, or refused with the reason |
 | `delete-end` | `id` | `{"ok":true,"existed"}` |
+| `person-says` | `mode` (`hold`, `give` or `auto`), `forSecs` (whole, 60 to 604800; only for `hold` and `give`), optional `holder` | `{"ok":true,"mode","until"}`; `until` is null for `auto` |
+
+### What `status` answers
+
+One object. Numbers in GB may have fractions; seconds are whole.
+
+| Field | |
+|---|---|
+| `protocol` | `pressroom.local/1` |
+| `name`, `kind`, `os`, `arch` | The machine. `kind` is `workstation` or `worker` (`server` reads as `worker`). |
+| `threads`, `memoryGb` | What the machine has |
+| `offeredThreads`, `offeredMemoryGb` | What it offers now (rule 1) |
+| `personPresent` | Whether its person counts as present, after what they said |
+| `personSays` | Null, or `{"mode","holder","since","until"}` while a `hold` or `give` stands |
+| `usedThreads`, `usedMemoryGb` | What admitted work holds |
+| `load1`, `outsideLoad` | Load average, and the whole threads of it pressroom did not admit |
+| `diskFreeGb`, `diskFloorGb` | Free disk and the floor below which nothing new starts |
+| `toolchains` | `[{"name","version"}]` |
+| `managed` | The managed folders |
+| `running` | `[{"job","holder","label","class","threads","memoryGb","lane","pid","forSecs"}]`; `lane` and `pid` may be null |
+| `waiting` | `[{"holder","label","class","threads","reason","forSecs"}]`, in the order they will be admitted |
+| `leases` | Live leases, each as its lease file |
+| `unreadableLeases` | Names of lease files that cannot be read |
+
+A client ignores fields it does not know; later versions may add some.
 
 A refusal is `{"ok":false,"state":"refused","reason":"..."}`. A request that cannot be
 read, or has a field of the wrong type, is refused in the same way; no field is quietly
@@ -163,7 +202,9 @@ replaced by a default. A connection that sends nothing for ten seconds is closed
 - **A `run` that is killed outright frees its place at once,** even if the command it
   started is still going.
 - **Holders are labels.** Anything running as the daemon's user can use the socket, and
-  the process a job names is taken on trust beyond being alive.
+  the process a job names is taken on trust beyond being alive. That includes
+  `person-says`: an agent running as the person's user could say `give`. The events log
+  records who said it.
   Identity and grants come with enrolment.
 - **It does not judge "stuck".** `status` shows how long a job has run and how busy the
   machine is.

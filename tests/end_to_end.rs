@@ -860,3 +860,89 @@ fn a_slow_or_stuck_sender_neither_holds_the_daemon_nor_moves_the_timetable() {
     fs::remove_file(out.join("slow")).unwrap();
     wait_file(&m.home.join("events.log"), |e| e.contains("report_sent"));
 }
+
+#[test]
+fn the_person_can_hold_the_machine_and_give_it_back() {
+    let m = Machine::start("person", ONE_THREAD);
+    let threads = |status: &str| -> String {
+        let at = status.find("\"offeredThreads\":").unwrap() + 17;
+        status[at..].split(',').next().unwrap().to_string()
+    };
+    assert_eq!(threads(&m.status()), "1");
+    assert!(m.status().contains("\"personSays\":null"));
+
+    // Hold: nothing new starts, and the wait says why.
+    let out = m.cmd(&["person", "hold", "--minutes", "30", "--holder", "user:test"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let status = m.status();
+    assert!(
+        status.contains("\"personSays\":{\"mode\":\"hold\",\"holder\":\"user:test\""),
+        "{status}"
+    );
+    assert_eq!(threads(&status), "0");
+    let job = m
+        .command(&[
+            "run",
+            "--threads",
+            "1",
+            "--memory-gb",
+            "0",
+            "--class",
+            "waiting",
+            "--",
+            "true",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    m.wait_for("the job held", |s| {
+        s.contains("asked for the whole machine")
+    });
+    assert!(m.status().contains("\"running\":[]"));
+
+    // Auto: back to what is measured, and the held job runs.
+    let out = m.cmd(&["person", "auto"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let done = job.wait_with_output().unwrap();
+    assert!(done.status.success(), "{}", text(&done.stderr));
+    assert!(
+        text(&done.stderr).contains("whole machine"),
+        "it was told why it waited"
+    );
+    assert!(m.status().contains("\"personSays\":null"));
+
+    // Give: every thread on the machine, more than the owner's away share.
+    let out = m.cmd(&["person", "give", "--minutes", "60"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let status = m.status();
+    let all = status
+        .split("\"threads\":")
+        .nth(1)
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(threads(&status), all, "{status}");
+    assert!(status.contains("\"personPresent\":false"));
+
+    // What the person says is checked like everything else.
+    for bad in [
+        r#"{"op":"person-says","mode":"sleep","forSecs":600}"#,
+        r#"{"op":"person-says","mode":"hold"}"#,
+        r#"{"op":"person-says","mode":"hold","forSecs":10}"#,
+        r#"{"op":"person-says","mode":"hold","forSecs":"600"}"#,
+        r#"{"op":"person-says","mode":"give","forSecs":99999999}"#,
+        r#"{"op":"person-says","mode":"auto","forSecs":600}"#,
+    ] {
+        let reply = first_line(raw(&m, bad));
+        assert!(reply.contains("\"state\":\"refused\""), "{bad} -> {reply}");
+    }
+    let events = fs::read_to_string(m.home.join("events.log")).unwrap();
+    assert_eq!(
+        events.matches("\"event\":\"person_says\"").count(),
+        3,
+        "{events}"
+    );
+}

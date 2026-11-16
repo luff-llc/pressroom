@@ -39,6 +39,11 @@ pressroom: the gatekeeper for work on this machine
   pressroom lease release ID
   pressroom leases [--json]       live leases, read from the files (no daemon needed)
 
+  pressroom person hold|give|auto [--minutes N] [--holder WHO]
+      The person says: hold (I need the whole machine: nothing new starts), give (take
+      it all, I am away: every thread is offered) or auto (back to what is measured).
+      hold and give last N minutes (default 60, at most a week).
+
   pressroom may-delete PATH       exit 0 if a cleanup tool may remove PATH, else 1 and why
   pressroom delete-begin [--ttl-minutes N] [--holder WHO] PATH
       Take a delete lease before removing PATH. Prints its id, or exits 1 and says why.
@@ -204,6 +209,26 @@ fn main() {
             },
             _ => usage("lease add or lease release"),
         },
+        "person" => {
+            let Some(mode) = rest.first() else {
+                usage("person needs hold, give or auto")
+            };
+            let (options, extra) = split(&rest[1..], &[], &["--minutes", "--holder"]);
+            if !extra.is_empty() {
+                usage("person takes hold, give or auto, then options");
+            }
+            if !["hold", "give", "auto"].contains(&mode.as_str()) {
+                usage("person needs hold, give or auto");
+            }
+            let (mut minutes, mut holder) = (60.0, client::default_holder());
+            for (name, value) in options {
+                match name.as_str() {
+                    "--minutes" => minutes = number(&name, &value),
+                    _ => holder = value,
+                }
+            }
+            client::person_says(&layout, &holder, mode, minutes)
+        }
         "may-delete" => match rest.first() {
             Some(path) => client::may_delete(&layout, path),
             None => usage("may-delete needs a path"),
