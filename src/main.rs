@@ -1,6 +1,7 @@
 //! Pressroom: one gatekeeper per machine. See README.md and contracts/local-v1.md.
 
 mod admit;
+mod cap;
 mod client;
 mod daemon;
 mod job;
@@ -32,7 +33,10 @@ pressroom: the gatekeeper for work on this machine
         --holder WHO       who is asking (default $PRESSROOM_HOLDER, else user:$USER)
         --label TEXT       what to call it in `status` (default: the command)
         --no-nice          do not lower the priority of batch work
+        --device           it runs an emulator or simulator: take the device slot
       The command sees PRESSROOM_THREADS, CARGO_BUILD_JOBS, RUST_TEST_THREADS, MAKEFLAGS.
+      It is held to the threads it is given: a command that starts more runs slower.
+      Inside a running job (PRESSROOM_JOB is set) it is part of that job and does not wait.
 
   pressroom status [--json]       what is running, what waits and why, what is leased
   pressroom measure               this machine, measured now, as JSON
@@ -155,7 +159,7 @@ fn main() {
                 "--holder",
                 "--label",
             ];
-            let (options, command) = split(rest, &["--no-nice"], &valued);
+            let (options, command) = split(rest, &["--no-nice", "--device"], &valued);
             if command.is_empty() {
                 usage("run needs a command after --");
             }
@@ -170,6 +174,7 @@ fn main() {
                 holder: client::default_holder(),
                 label: None,
                 nice: true,
+                device: false,
                 command,
             };
             for (name, value) in options {
@@ -183,6 +188,7 @@ fn main() {
                     "--lease-kind" => a.lease_kind = value,
                     "--holder" => a.holder = value,
                     "--label" => a.label = Some(value),
+                    "--device" => a.device = true,
                     _ => a.nice = false,
                 }
             }

@@ -75,12 +75,32 @@ struct RunningRow: View {
                 .font(.callout)
                 .lineLimit(1)
                 .truncationMode(.middle)
-            Text("\(job.holder) · \(job.threads) threads · \(job.class) · for \(span(job.forSecs))")
+            Text("\(job.holder) · \(threads) · \(job.class) · for \(span(job.forSecs))")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+            if let flag {
+                Text(flag)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+            }
         }
         .accessibilityElement(children: .combine)
+    }
+
+    /// Use against grant, once measured: "4 threads, using 3.2".
+    private var threads: String {
+        let granted = job.threads == 1 ? "1 thread" : "\(job.threads) threads"
+        guard let use = job.useThreads else { return granted }
+        return "\(granted), using \(use.formatted(.number.precision(.fractionLength(1))))"
+    }
+
+    /// What is worth the person's eye: over its grant, or held back to it.
+    private var flag: String? {
+        if job.over == true { return "Over its grant" }
+        if job.held == true { return "Held to its grant" }
+        return nil
     }
 }
 

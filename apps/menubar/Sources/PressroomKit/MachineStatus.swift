@@ -51,6 +51,16 @@ public struct MachineStatus: Decodable, Sendable, Equatable {
         public var lane: String?
         public var pid: Int?
         public var forSecs: Int
+        /// What it was last measured to use (rule 24). Absent from older daemons, and
+        /// null until first measured.
+        public var useThreads: Double?
+        public var useMemoryGb: Double?
+        /// Using more than it was granted.
+        public var over: Bool?
+        /// Held back to its grant at the last measure (rule 23).
+        public var held: Bool?
+        /// It holds the machine's device slot (rule 27).
+        public var device: Bool?
         public var id: String { job }
     }
 

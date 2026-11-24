@@ -3,12 +3,13 @@
 //! work whether or not the daemon is up.
 
 use crate::admit::GB;
+use crate::cap::{self, Means, Notice, Watch};
 use crate::json::{self, n, n64, obj, s, strs, Value};
 use crate::lease::{self, DeleteRules, Store, Verdict};
 use crate::machine::{self, now, Layout};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -100,6 +101,8 @@ pub struct RunArgs {
     pub holder: String,
     pub label: Option<String>,
     pub nice: bool,
+    /// It runs an emulator or simulator (rule 27).
+    pub device: bool,
     pub command: Vec<String>,
 }
 
@@ -137,6 +140,21 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
             "lane",
             obj(vec![("repo", s(repo)), ("toolchain", s(&args.toolchain))]),
         ));
+    }
+    if args.device {
+        request.push(("device", Value::Bool(true)));
+    }
+    // Started inside a running job: part of it (rule 26). Only where that job's `run`
+    // saw a daemon that knows rule 26 (it then sets PRESSROOM_JOB_PID): an older daemon
+    // would queue this behind the job it is part of.
+    let outer_run: Option<u32> = std::env::var("PRESSROOM_JOB_PID")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .filter(|&p| p > 1);
+    if let (Ok(outer), Some(_)) = (std::env::var("PRESSROOM_JOB"), outer_run) {
+        if !outer.is_empty() && outer.len() <= 64 {
+            request.push(("within", s(outer)));
+        }
     }
     let mut line = json::write(&obj(request));
     line.push('\n');
@@ -218,15 +236,71 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
         );
     }
 
-    let mut command = if args.nice && args.class == "batch" {
-        let mut c = Command::new("nice");
-        c.args(["-n", "10"]).args(&args.command);
-        c
-    } else {
-        let mut c = Command::new(&args.command[0]);
-        c.args(&args.command[1..]);
-        c
+    // Inside another job (rule 26): that job's hold holds this one too, until it ends.
+    let inside = admitted.str("within").is_some();
+    // A daemon that knows rules 23 to 28 says how it holds work.
+    let knows_rule_26 = admitted.str("cap").is_some();
+    let granted: u32 = threads.parse().unwrap_or(1);
+    let cap_memory = admitted
+        .num("capMemoryGb")
+        .filter(|g| g.is_finite() && *g > 0.0)
+        .map(|g| (g * GB as f64) as u64);
+    let means = match admitted.str("cap") {
+        _ if inside => Means::Within,
+        Some("measure") => Means::Measure,
+        Some("stop") => Means::Stop,
+        // `hold`, and a daemon too old to say: the best means here.
+        _ if cap::scope_works() => Means::Scope(std::path::PathBuf::new()),
+        _ => Means::Stop,
     };
+
+    let mut argv: Vec<String> = Vec::new();
+    if args.nice && args.class == "batch" {
+        argv.extend(["nice", "-n", "10"].map(String::from));
+    }
+    argv.extend(args.command.iter().cloned());
+    let unit = cap::scope_unit(&job);
+    let mut bus_env = None;
+    if let Means::Scope(_) = means {
+        // A program that cannot be found gives 127, not systemd-run's own failure.
+        if cap::find_program(&args.command[0]).is_none() {
+            eprintln!("pressroom: cannot start {}: not found", args.command[0]);
+            return finish_job(&mut stream, 127, &[], 0.0, None);
+        }
+        let mut scoped: Vec<String> = [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            // Otherwise systemd-run reads `$NAME` and `$$` in the command's own arguments.
+            "--expand-environment=no",
+        ]
+        .map(String::from)
+        .to_vec();
+        scoped.push(format!("--unit={unit}"));
+        scoped.extend(["-p".into(), format!("CPUQuota={}%", granted * 100)]);
+        if let Some(bytes) = cap_memory {
+            scoped.extend(["-p".into(), format!("MemoryMax={bytes}")]);
+        }
+        scoped.push("--".into());
+        scoped.extend(argv);
+        argv = scoped;
+        bus_env = cap::user_bus_env();
+    }
+
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    if let Some((k, v)) = bus_env {
+        command.env(k, v);
+    }
+    // Its own process group, so all of it can be held, and passed a signal, at once.
+    command.process_group(0);
+    if knows_rule_26 {
+        command.env("PRESSROOM_JOB_PID", std::process::id().to_string());
+    } else {
+        command.env_remove("PRESSROOM_JOB_PID");
+    }
     command
         .env("PRESSROOM_JOB", &job)
         .env("PRESSROOM_THREADS", &threads)
@@ -243,18 +317,21 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
     }
     // Only what was there when the job started can have been removed under it.
     let present: Vec<&String> = leases.iter().filter(|p| Path::new(p).exists()).collect();
-    let (exit, started) = match command.status() {
-        // A command ended by a signal reports 128 plus the signal, as a shell does.
-        Ok(status) => (
-            status
-                .code()
-                .or_else(|| status.signal().map(|sig| 128 + sig))
-                .unwrap_or(1),
-            true,
-        ),
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+    let (exit, started, held_secs, held_by) = match command.spawn() {
+        Ok(child) => {
+            let outer = if inside { outer_run } else { None };
+            let (status, held_secs, held_by) =
+                watch(&mut stream, child, means, granted, cap_memory, &unit, outer);
+            // A command ended by a signal reports 128 plus the signal, as a shell does.
+            let code = status
+                .and_then(|status| status.code().or_else(|| status.signal().map(|sig| 128 + sig)))
+                .unwrap_or(1);
+            (code, true, held_secs, held_by)
+        }
         Err(e) => {
             eprintln!("pressroom: cannot start {}: {e}", args.command[0]);
-            (127, false)
+            (127, false, 0.0, None)
         }
     };
 
@@ -264,14 +341,7 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
         .filter(|p| started && !Path::new(p).exists())
         .cloned()
         .collect();
-    let done = obj(vec![
-        ("op", s("done")),
-        ("exit", n(exit)),
-        ("missing", strs(&missing)),
-    ]);
-    let mut line = json::write(&done);
-    line.push('\n');
-    let _ = stream.write_all(line.as_bytes());
+    finish_job(&mut stream, exit, &missing, held_secs, held_by);
     if !missing.is_empty() {
         eprintln!(
             "pressroom: removed while this job held a lease on it: {}",
@@ -286,6 +356,168 @@ pub fn run(layout: &Layout, args: RunArgs) -> i32 {
         }
     }
     exit
+}
+
+/// Tell the daemon how the job ended. Returns the exit code, for the early returns.
+fn finish_job(
+    stream: &mut UnixStream,
+    exit: i32,
+    missing: &[String],
+    held_secs: f64,
+    held_by: Option<&str>,
+) -> i32 {
+    let done = obj(vec![
+        ("op", s("done")),
+        ("exit", n(exit)),
+        ("missing", strs(missing)),
+        ("heldSecs", n((held_secs * 10.0).round() / 10.0)),
+        ("means", held_by.map_or(Value::Null, s)),
+    ]);
+    let mut line = json::write(&done);
+    line.push('\n');
+    let _ = stream.write_all(line.as_bytes());
+    exit
+}
+
+fn send_line(stream: &mut UnixStream, value: &Value) {
+    let mut line = json::write(value);
+    line.push('\n');
+    // The daemon may be gone (rule 22); the job goes on, and so does its hold.
+    let _ = stream.write_all(line.as_bytes());
+}
+
+/// Tell the job, and the daemon's log, what its hold did (rule 25).
+fn tell(stream: &mut UnixStream, notices: Vec<Notice>) {
+    for notice in notices {
+        eprintln!("pressroom: {}", notice.text);
+        send_line(
+            stream,
+            &obj(vec![
+                ("op", s("event")),
+                ("event", s(notice.event)),
+                ("text", s(&notice.text)),
+            ]),
+        );
+    }
+}
+
+/// Tell the daemon how the job is held and what it may be stopped by (rules 24 and 28),
+/// with what it used when that is known.
+fn send_use(stream: &mut UnixStream, w: &Watch, pid: i32, used: Option<&cap::Use>) {
+    send_targets(stream, w.means.name(), pid, w.targets(), used);
+}
+
+fn send_targets(
+    stream: &mut UnixStream,
+    means: &str,
+    pid: i32,
+    targets: &cap::Targets,
+    used: Option<&cap::Use>,
+) {
+    let mut fields = vec![
+        ("op", s("use")),
+        ("means", s(means)),
+        ("pgid", n(pid)),
+        (
+            "groups",
+            Value::Arr(targets.groups.iter().take(cap::MAX_REPORTED).map(|&g| n(g)).collect()),
+        ),
+        (
+            "pids",
+            Value::Arr(targets.pids.iter().take(cap::MAX_REPORTED).map(|&p| n(p)).collect()),
+        ),
+    ];
+    if let Some(used) = used {
+        fields.push(("held", Value::Bool(used.held)));
+        fields.push(("heldSecs", n((used.held_secs * 10.0).round() / 10.0)));
+        if let (Some(threads), Some(memory)) = (used.threads, used.memory) {
+            fields.push(("threads", n((threads * 100.0).round() / 100.0)));
+            fields.push(("memoryGb", n((memory as f64 / GB as f64 * 100.0).round() / 100.0)));
+        }
+    }
+    send_line(stream, &obj(fields));
+}
+
+/// Wait for the job, holding it to its grant and saying what it uses (rules 23 to 25).
+/// `outer` is the `run` of the job this one is part of (rule 26): once it is gone, this
+/// one holds itself. Returns how it ended, for how many seconds it was held back, and by
+/// what means.
+fn watch(
+    stream: &mut UnixStream,
+    mut child: std::process::Child,
+    mut means: Means,
+    granted: u32,
+    cap_memory: Option<u64>,
+    unit: &str,
+    outer: Option<u32>,
+) -> (Option<std::process::ExitStatus>, f64, Option<&'static str>) {
+    let pid = child.id() as i32;
+    if let Means::Scope(_) = means {
+        // systemd-run makes the scope, then becomes the command. Should no scope appear,
+        // hold it by stopping instead.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        means = loop {
+            if let Some(dir) = cap::scope_of(pid, unit) {
+                break Means::Scope(dir);
+            }
+            if std::time::Instant::now() >= until || matches!(child.try_wait(), Ok(Some(_))) {
+                break Means::Stop;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+    }
+    cap::sys::catch_endings();
+    let gave_terminal = cap::sys::give_terminal(pid);
+    let mut w = Watch::new(means, pid, pid, granted, cap_memory.unwrap_or(0));
+    // Before anything can be stopped, the daemon knows how and what (rule 28).
+    send_use(stream, &w, pid, None);
+    if w.means == Means::Measure {
+        tell(
+            stream,
+            vec![Notice {
+                event: "not_held",
+                text: "this machine measures jobs but does not hold them to their grant \
+                       (cap = measure)"
+                    .into(),
+            }],
+        );
+    }
+    let mut last_report = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if w.means == Means::Within && outer.is_some_and(|run| !cap::sys::running(run as i32)) {
+            // The job this was part of has ended; the daemon now charges this one.
+            let notice = w.on_its_own();
+            tell(stream, vec![notice]);
+            send_use(stream, &w, pid, None);
+        }
+        // Told before they are stopped, so a `run` killed meanwhile leaves none unknown.
+        let notices = w.tick(&mut |targets| send_targets(stream, "stop", pid, targets, None));
+        tell(stream, notices);
+        if let Some(sig) = cap::sys::take_caught() {
+            // Asked to end: pass it on, and hold the job no more so it can end promptly.
+            w.let_go();
+            cap::sys::kill(-pid, sig);
+        }
+        if last_report.elapsed() >= cap::REPORT_EVERY {
+            last_report = std::time::Instant::now();
+            let (used, notices) = w.report();
+            tell(stream, notices);
+            send_use(stream, &w, pid, Some(&used));
+        }
+        std::thread::sleep(cap::TICK);
+    };
+    let (held_secs, notices) = w.finish();
+    tell(stream, notices);
+    if gave_terminal {
+        cap::sys::take_terminal();
+    }
+    let held_by = (w.means != Means::Within).then(|| w.means.name());
+    (status, held_secs, held_by)
 }
 
 pub fn status(layout: &Layout, as_json: bool) -> i32 {
