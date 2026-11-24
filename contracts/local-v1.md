@@ -5,8 +5,8 @@ who run work, and tools that clean up. Version `pressroom.local/1`; lease files 
 `pressroom.lease/1`. Tested by `tests/end_to_end.rs`. Checked once by a separate agent on
 2026-11-15; what it found and what was done is in `docs/review/2026-11-15-slice-1.md`.
 
-This covers one machine. The report to Galley is `report-v1.md`; enrolment, grants and power
-are later contracts.
+This covers one machine. The report to Galley is `report-v1.md`; work placed from another
+machine is `job-v1.md`; enrolment, grants and power are later contracts.
 
 ## Files
 

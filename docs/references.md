@@ -8,3 +8,6 @@ standard library is not enough, in this file, before it appears in `Cargo.toml`.
 The daemon runs these programs, which every supported system ships: `df`, `hostname`,
 `uname`, `nice`, and on macOS `sysctl`, `ioreg` and `/bin/kill`. It probes for `rustc`,
 `cargo`, `bun`, `node` and `xcodebuild` to report toolchains.
+
+Placed work (`contracts/job-v1.md`) also runs `git`, `tar` and, for a machine reached over
+SSH, `ssh`.
