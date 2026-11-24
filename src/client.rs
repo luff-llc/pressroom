@@ -52,7 +52,7 @@ fn join(layout: &Layout, line: &str) -> Result<(UnixStream, BufReader<UnixStream
     Ok((stream, reader))
 }
 
-fn ask(layout: &Layout, request: &Value) -> Result<Value, String> {
+pub fn ask(layout: &Layout, request: &Value) -> Result<Value, String> {
     let mut stream = connect(layout)?;
     let mut line = json::write(request);
     line.push('\n');

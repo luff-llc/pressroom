@@ -3,9 +3,12 @@
 mod admit;
 mod client;
 mod daemon;
+mod job;
 mod json;
 mod lease;
 mod machine;
+mod place;
+mod recipe;
 
 use machine::Layout;
 use std::process::exit;
@@ -49,6 +52,27 @@ pressroom: the gatekeeper for work on this machine
   pressroom delete-begin [--ttl-minutes N] [--holder WHO] PATH
       Take a delete lease before removing PATH. Prints its id, or exits 1 and says why.
   pressroom delete-end ID
+
+  pressroom place --repo REPO --kind KIND [options]
+      Choose a machine from machines.conf, run a recipe there on a snapshot of this
+      folder, and bring its results back. A request names a recipe; it never carries a
+      command. contracts/job-v1.md.
+        --param NAME=VALUE  a recipe parameter; repeat for each value of a list
+        --env NAME=VALUE    passed to the job if the recipe lets it through
+        --needs TOOL=VER    only machines that report TOOL at VER (e.g. xcode=27.2)
+        --tree HASH         run this tree (default: everything here now, less ignored)
+        --source DIR        the git folder to take source from (default .)
+        --machine NAME      only this machine
+        --results DIR       where results go (default pressroom-results/ID)
+        --class CLASS       waiting, gate or batch (default batch)
+        --id ID             the job's id (default made up)
+        --holder WHO        who is asking
+        --dry-run           show the choice and the request; run nothing
+
+  pressroom job probe | run | show ID | fetch ID | ssh
+      The machine's half of placed work. `run` reads a request and a git pack on
+      standard input. `ssh` is for a forced command in authorized_keys.
+  pressroom job recipes             the recipes this machine has, and any it cannot read
 
 Files live in $PRESSROOM_HOME, else ~/.pressroom. Limits are in machine.conf there.
 ";
@@ -260,6 +284,81 @@ fn main() {
         "delete-end" => match rest.first() {
             Some(id) => client::release(&layout, "delete-end", id),
             None => usage("delete-end needs an id"),
+        },
+        "place" => {
+            let valued = [
+                "--repo",
+                "--kind",
+                "--param",
+                "--env",
+                "--needs",
+                "--tree",
+                "--source",
+                "--machine",
+                "--results",
+                "--class",
+                "--id",
+                "--holder",
+            ];
+            let (options, extra) = split(rest, &["--dry-run"], &valued);
+            if !extra.is_empty() {
+                usage("place takes options only; a request never carries a command");
+            }
+            let mut a = place::PlaceArgs {
+                repo: String::new(),
+                kind: String::new(),
+                tree: None,
+                source: ".".into(),
+                params: Vec::new(),
+                env: Vec::new(),
+                needs: Vec::new(),
+                class: "batch".into(),
+                holder: client::default_holder(),
+                machine: None,
+                results: None,
+                id: None,
+                dry_run: false,
+            };
+            let pair = |name: &str, value: &str| -> (String, String) {
+                match value.split_once('=') {
+                    Some((k, v)) if !k.is_empty() => (k.to_string(), v.to_string()),
+                    _ => usage(&format!("{name} needs NAME=VALUE, not {value:?}")),
+                }
+            };
+            for (name, value) in options {
+                match name.as_str() {
+                    "--repo" => a.repo = value,
+                    "--kind" => a.kind = value,
+                    "--param" => a.params.push(pair(&name, &value)),
+                    "--env" => a.env.push(pair(&name, &value)),
+                    "--needs" => a.needs.push(pair(&name, &value)),
+                    "--tree" => a.tree = Some(value),
+                    "--source" => a.source = value.into(),
+                    "--machine" => a.machine = Some(value),
+                    "--results" => a.results = Some(value.into()),
+                    "--class" => a.class = value,
+                    "--id" => a.id = Some(value),
+                    "--holder" => a.holder = value,
+                    _ => a.dry_run = true,
+                }
+            }
+            if a.repo.is_empty() || a.kind.is_empty() {
+                usage("place needs --repo and --kind");
+            }
+            if !["waiting", "gate", "batch"].contains(&a.class.as_str()) {
+                usage("--class is waiting, gate or batch");
+            }
+            place::place(&layout, a)
+        }
+        "job" => match (rest.first().map(String::as_str), rest.get(1)) {
+            (Some("probe"), None) => job::probe(&layout),
+            (Some("run"), None) => job::run(&layout),
+            (Some("exec"), Some(id)) => job::exec(&layout, id),
+            (Some("show"), Some(id)) => job::show(&layout, id),
+            (Some("fetch"), Some(id)) => job::fetch(&layout, id),
+            (Some("ssh"), None) => job::ssh(&layout),
+            (Some("recipes"), None) => job::recipes(&layout),
+            _ => usage("job probe | run | show ID | fetch ID | ssh | recipes"),
         },
         "help" | "--help" | "-h" => {
             print!("{HELP}");

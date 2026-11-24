@@ -5,8 +5,8 @@ starts without it; it knows what the machine offers and how busy it is; and it k
 list of what is in use, so that a cleanup tool can see what it must leave alone.
 
 This repository is the daemon and its contracts. The design is in the Galley repository
-(`docs/design/2026-11-15-device-capacity.md`). **Status: slice 1, the local half.** It
-runs on one machine and talks to nothing else yet.
+(`docs/design/2026-11-15-device-capacity.md`). **Status:** the local half, the report to
+Galley, and the first slice of placing work on other machines.
 
 ## Install
 
@@ -45,6 +45,24 @@ id=$(pressroom delete-begin /path/under/a/managed/folder) && rm -rf /path/... ; 
 `delete-begin` exits 1 and says why when the path must be kept. A tool that knows nothing
 of pressroom can read `~/.pressroom/leases/*.json` directly. The rules are in
 [contracts/local-v1.md](contracts/local-v1.md).
+
+## Placing work on other machines
+
+`pressroom place` runs one kind of work on another machine and brings the results back.
+The machines it may use are listed in `machines.conf`; each one runs only the recipes its
+owner put in its `recipes/` folder. A request names a recipe and fills in its parameters.
+It never carries a command.
+
+```sh
+pressroom place --repo demo --kind host --param script=scripts/test-x.py
+```
+
+It snapshots the folder as a git tree, asks every machine what it offers, says why each
+can or cannot take the work, sends the chosen one only the objects it lacks, and waits.
+The job is local work there, admitted and held like any other, in its repository's lane.
+Its log and results land in `pressroom-results/<id>`, and `place` exits with the job's own
+code. The rules are in [contracts/job-v1.md](contracts/job-v1.md); the design, including
+how hosted runners fit, in [docs/design/placement.md](docs/design/placement.md).
 
 ## Seen in Galley
 
